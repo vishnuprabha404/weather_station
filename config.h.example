@@ -1,0 +1,49 @@
+#pragma once
+// Copy this file to config.h and fill in real values.
+// config.h itself is gitignored — never commit real credentials.
+
+#define WIFI_SSID     "your-network-name"
+#define WIFI_PASSWORD "your-network-password"
+
+// Your location -- used for Open-Meteo's daily-overview page (high/low,
+// precip chance, sunrise/sunset) and isDay. Decimal degrees.
+#define WEATHER_LATITUDE   0.00
+#define WEATHER_LONGITUDE  0.00
+#define WEATHER_LOCATION_NAME "YOUR CITY"
+
+// Environment Canada's own site identifier for this location, used to pull
+// CURRENT CONDITIONS' condition text/icon -- this is what actually
+// generates the weather.gc.ca city page's description, so it's the most
+// trustworthy source available for that field. Daily high/low/precip/
+// sunrise-sunset still come from Open-Meteo above (see weather_ec.h for
+// why), and temperature/feels-like/humidity/wind come from SWOB below
+// (see weather_swob.h for why). To find this for your location: query
+// https://api.weather.gc.ca/collections/citypageweather-realtime/items?f=json&name.en=<City%20Name>
+// and use the returned "identifier" (e.g. "on-40" for Greater Sudbury).
+#define WEATHER_EC_SITE_ID "your-ec-site-id"
+
+// Environment Canada's SWOB (Surface Weather Observations) station
+// identifier -- this is the SAME physical station as WEATHER_EC_SITE_ID
+// above, but queried via its raw per-MINUTE telemetry feed instead of the
+// once-an-hour citypage rollup, so temperature/feels-like/humidity/wind
+// actually refresh on WEATHER_REFRESH_MINUTES' cadence below (see
+// weather_swob.h for why the citypage feed alone wasn't fresh enough).
+// This is the "tc_id" field, NOT the same value/format as the site ID
+// above. To find it for your location: query
+// https://api.weather.gc.ca/collections/swob-realtime/items?f=json&bbox=<west>,<south>,<east>,<north>&limit=5
+// with a small bbox around your coordinates (WEATHER_LATITUDE/LONGITUDE
+// above, +/- ~0.2 degrees is usually enough to find the nearest station),
+// and use the returned "tc_id-value" (e.g. "TSB" for Greater Sudbury's
+// climate station). Then confirm it works and updates every ~1 minute via
+// https://api.weather.gc.ca/collections/swob-realtime/items?f=json&tc_id-value=<id>&sortby=-date_tm-value&limit=3
+#define WEATHER_SWOB_STATION_ID "your-swob-station-id"
+
+// How often to check for new weather data in the background (drives all
+// three sources -- SWOB, EC citypage, Open-Meteo). This is just the CHECK
+// cadence, not the display cadence -- the panel only actually redraws when
+// a check comes back with a visibly different value (see
+// weatherDisplayChanged() in weather.cpp), so checking often here doesn't
+// mean flashing the screen often. SWOB's own telemetry updates roughly
+// every minute, so this interval is effectively how fresh the on-screen
+// numbers can ever be.
+#define WEATHER_REFRESH_MINUTES 10

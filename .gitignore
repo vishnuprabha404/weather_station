@@ -1,0 +1,2 @@
+# Real credentials/config -- never commit. Copy config.h.example to config.h.
+config.h
