@@ -344,6 +344,29 @@ function that can be invoked from a partial-update path (i.e. anything
 reachable from `drawTimePartial()`/`drawDatePartial()`/
 `drawWeatherPartial()`) the same way before trusting it.
 
+**Date-line descenders slowly fading, caused by the minute-tick clear
+region (`renderer.cpp`'s `DATE_PY1`/`TIME_PY0` constants).** Found from a
+hardware photo: the tail of a descender letter on the date line (e.g. the
+'y' in "Monday") was visibly fading over time, specifically correlated with
+minute ticks, not date changes. Root cause: `DATE_PY1` and `TIME_PY0` were
+the literal same value (`TIME_TEXT_Y - 5`) — a zero-buffer shared boundary
+between the date row's region and the time row's per-minute clear region.
+A descender dipping down to or past that shared line gets wiped by every
+minute tick's `epd_clear_area()` call (which starts exactly there) but
+never redrawn, since the minute tick only redraws time digits, not date
+text — so it erodes one tick at a time until the date itself next changes
+and gets a full redraw. Fixed by giving `TIME_PY0` a few px of headroom
+below `DATE_PY1` instead of sharing its value, so the per-minute clear
+region no longer reaches into where a date-line descender can land. Same
+category of lesson as the bug above: two independently-triggered partial-
+refresh regions sharing an exact pixel boundary is fragile — real glyph ink
+doesn't respect the nominal layout box a font's advance/position implies,
+so adjacent partial-refresh regions need a genuine buffer, not just
+touching edges. If time digits ever show their own top-edge ghosting after
+this fix, `TIME_PY0` was pushed down too far and needs dialing back
+partway — like the rest of this file's layout constants, treat this exact
+number as "best estimate from one hardware photo," not final.
+
 ## Refresh Strategy — Actual Implementation
 
 This differs substantially from the original plan below (which only covered

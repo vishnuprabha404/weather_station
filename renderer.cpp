@@ -286,8 +286,24 @@ static const int32_t LASTUPD_PY    = 905;
 // Partial-refresh regions, in PORTRAIT space (converted to native internally).
 // Time gets its OWN independent region so a minute-tick refresh never
 // touches the date, location, or anything else on the panel.
+//
+// BUG FIX (found from a hardware photo, see CLAUDE.md's "Known Bugs Fixed"):
+// DATE_PY1 and TIME_PY0 used to be the literal same value (both
+// TIME_TEXT_Y-5) -- a zero-buffer shared boundary. A descender on the date
+// line (the tail of a 'y'/'g'/'j' -- e.g. "Monday") can dip down to or past
+// that line, and every MINUTE tick's clear-and-redraw starts exactly there,
+// wiping that sliver of ink without ever redrawing it (the minute tick only
+// draws time digits, not date text) -- so it visibly fades away one tick at
+// a time until the date itself next changes and gets a full redraw. Fixed
+// by giving TIME_PY0 a few px of headroom below DATE_PY1 instead of sharing
+// its exact value, so the per-minute clear never reaches into where a
+// descender could land. This is a hardware-photo-tuned number like the rest
+// of this file's layout constants -- if time digits ever show their own
+// top-edge ghosting after this change, TIME_PY0 was pushed down too far and
+// needs dialing back partway (it must still fully cover the medium font's
+// real ink top, just not reach up into the date row above it).
 static const int32_t DATE_PY0 = LOCATION_PY + 40, DATE_PY1 = TIME_TEXT_Y - 5;
-static const int32_t TIME_PY0 = TIME_TEXT_Y - 5, TIME_PY1 = TIME_TEXT_Y + (int32_t)ui_font_medium_height + 5;
+static const int32_t TIME_PY0 = TIME_TEXT_Y + 3, TIME_PY1 = TIME_TEXT_Y + (int32_t)ui_font_medium_height + 5;
 static const int32_t WEATHER_PY0 = MAIN_TOP - 10, WEATHER_PY1 = LASTUPD_PY + 30;
 
 // Daily-page back button, in PORTRAIT space.
