@@ -347,37 +347,53 @@ reachable from `drawTimePartial()`/`drawDatePartial()`/
 ## Known Open Issues
 
 **Date-line descenders slowly fading, caused by the minute-tick clear
-region (`renderer.cpp`'s `DATE_PY1`/`TIME_PY0` constants) — attempted fix
-REVERTED, still open.** Found from a hardware photo: the tail of a
-descender letter on the date line (e.g. the 'y' in "Monday") visibly fades
-over time, specifically correlated with minute ticks, not date changes.
-Root cause: `DATE_PY1` and `TIME_PY0` are the literal same value
-(`TIME_TEXT_Y - 5`) — a zero-buffer shared boundary between the date row's
-region and the time row's per-minute clear region. A descender dipping
-down to or past that shared line gets wiped by every minute tick's
+region (`renderer.cpp`'s `DATE_PY1`/`TIME_PY0` constants) — second attempt
+made, NOT yet confirmed on hardware.** Found from a hardware photo: the
+tail of a descender letter on the date line (e.g. the 'y' in "Monday")
+visibly fades over time, specifically correlated with minute ticks, not
+date changes. Root cause: `DATE_PY1` and `TIME_PY0` are the literal same
+value (`TIME_TEXT_Y - 5`) — a zero-buffer shared boundary between the date
+row's region and the time row's per-minute clear region. A descender
+dipping down to or past that shared line gets wiped by every minute tick's
 `epd_clear_area()` call (which starts exactly there) but never redrawn,
 since the minute tick only redraws time digits, not date text — so it
 erodes one tick at a time until the date itself next changes and gets a
 full redraw.
 
-First fix attempt gave `TIME_PY0` a few px of headroom below `DATE_PY1`
-instead of sharing its value. **Reverted** (confirmed on hardware): that
-region also has to fully cover the medium font's real ink at the TOP of
-the time digits, and pushing it down clipped that instead — changed digits
-left a leftover line/ghost of the PREVIOUS digit's top edge, since the old
-glyph's topmost row(s) were no longer inside what gets cleared before the
-new one is drawn. Traded one visible bug for another, so it's back to the
-original (buggy but at-least-known) values for now.
+**First fix attempt** gave `TIME_PY0` a few px of headroom below
+`DATE_PY1` instead of sharing its value. **Reverted** (confirmed on
+hardware): that region also has to fully cover the medium font's real ink
+at the TOP of the time digits, and pushing it down clipped that instead —
+changed digits left a leftover line/ghost of the PREVIOUS digit's top
+edge, since the old glyph's topmost row(s) were no longer inside what gets
+cleared before the new one is drawn. Traded one visible bug for another.
 
-Lesson: two independently-triggered partial-refresh regions sharing an
-exact pixel boundary is fragile — real glyph ink doesn't respect the
-nominal layout box a font's advance/position implies, so adjacent
-partial-refresh regions need a genuine buffer on BOTH sides of the
-boundary, not just moving the boundary itself. The next attempt should
-probably give the DATE line more clearance instead (e.g. nudging `DATE_PY`
-up a few px, shrinking the ascent-headroom gap above it rather than the
-digit-coverage gap below `TIME_PY0`) — verify against a fresh hardware
-photo before landing, same as every other layout constant in this file.
+**Second attempt** (current state): rather than moving the shared boundary
+itself, moved the two things on either side of it further apart —
+requested independently by the user for layout/spacing reasons (date
+pulled closer to the location line, time pushed down for more breathing
+room, which also pushes the weather section down a bit). `DATE_PY` went
+from 70 to 62 (closer to the location row above it) and `TIME_TEXT_Y` went
+from 115 to 130 (more separation from the date line, and `MAIN_TOP`/the
+whole weather section shifts down with it automatically since those are
+computed from `TIME_TEXT_Y`). `DATE_PY1`/`TIME_PY0` still share the same
+formula and still touch at the same relative offset — but the real date
+ink now sits much higher (ending around DATE_PY+34+descender ≈ y=100) while
+the shared clear boundary is now at y=125, leaving roughly 25px of genuine
+clearance that didn't exist before (was 0px). This doesn't touch
+`TIME_PY0`'s coverage of the digit glyphs at all, so it shouldn't reintroduce
+the first attempt's regression — but this reasoning hasn't been verified
+against a real hardware photo yet. **Confirm on hardware before treating
+this as closed**: check that (a) the date-line descender no longer fades
+over several minute ticks, and (b) time digits still redraw cleanly with
+no leftover-line ghosting of their own.
+
+Lesson (still holds): two independently-triggered partial-refresh regions
+sharing an exact pixel boundary is fragile — real glyph ink doesn't
+respect the nominal layout box a font's advance/position implies. The fix
+that actually worked (or should have) was adding real distance between the
+CONTENT on either side of the boundary, not shrinking either region's own
+necessary coverage.
 
 ## Refresh Strategy — Actual Implementation
 

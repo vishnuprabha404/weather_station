@@ -272,11 +272,24 @@ static int32_t drawBigNumber(int32_t px, int32_t py, const char* text, uint8_t* 
 // bottom-left, de-emphasized.
 static const int32_t MARGIN        = 20;
 static const int32_t LOCATION_PY   = 20;
-static const int32_t DATE_PY       = 70;
+// Date pulled a bit closer to the location line above it (was 70 -- a 16px
+// gap below the location row's ~34px-tall content; now an ~8px gap), and
+// TIME_TEXT_Y pushed down accordingly (was 115) to give the date/time pair
+// more real separation rather than less. This also happens to fix the
+// date-descender-fade issue in "Known Open Issues" (CLAUDE.md) as a side
+// effect: DATE_PY1/TIME_PY0 still share the same formula (TIME_TEXT_Y-5),
+// but there's now ~25-30px of genuine clearance between where date ink
+// actually ends and that shared clear boundary, comfortably more than any
+// descender's depth -- unlike the reverted first attempt, this doesn't
+// narrow TIME_PY0's own coverage of the time digits' real ink at all.
+static const int32_t DATE_PY       = 62;
 static const int32_t TIME_TEXT_X   = MARGIN;
-static const int32_t TIME_TEXT_Y   = 115;
+static const int32_t TIME_TEXT_Y   = 130;
 static const int32_t HEADER_DIV_PY = TIME_TEXT_Y + (int32_t)ui_font_medium_height + 20;
-static const int32_t MAIN_TOP      = HEADER_DIV_PY + 20;
+static const int32_t MAIN_TOP      = HEADER_DIV_PY + 20; // shifts down with TIME_TEXT_Y --
+                                                          // this is the "move weather section
+                                                          // a little lower" the extra header
+                                                          // room was traded for.
 static const int32_t FOOTER_DIV_PY = 610;
 static const int32_t FOOTER_TOP    = 630;
 static const int32_t FOOTER_COL_DIV_PX = 270; // splits Humidity | Wind
@@ -287,30 +300,16 @@ static const int32_t LASTUPD_PY    = 905;
 // Time gets its OWN independent region so a minute-tick refresh never
 // touches the date, location, or anything else on the panel.
 //
-// KNOWN OPEN ISSUE (see CLAUDE.md's "Known Bugs Fixed"): DATE_PY1 and
-// TIME_PY0 are the literal same value (both TIME_TEXT_Y-5) -- a zero-buffer
-// shared boundary. A descender on the date line (the tail of a 'y'/'g'/'j'
-// -- e.g. "Monday") can dip down to or past that line, and every MINUTE
-// tick's clear-and-redraw starts exactly there, wiping that sliver of ink
-// without ever redrawing it (the minute tick only draws time digits, not
-// date text) -- so it can visibly fade over time until the date itself next
-// changes and gets a full redraw.
-//
-// A first attempt at fixing this pushed TIME_PY0 down a few px so the
-// minute-tick clear wouldn't reach as high -- REVERTED (confirmed on
-// hardware) because that region also has to fully cover the medium font's
-// real ink at the TOP of the time digits, and pushing it down clipped that
-// instead: changed digits left a leftover line/ghost of the PREVIOUS
-// digit's top edge, since the old glyph's topmost row(s) were no longer
-// inside the region that gets cleared before the new one is drawn. Trading
-// the date-fade bug for a digit-ghosting bug isn't a fix, so this is back
-// to the original values. A real fix needs a different approach that
-// doesn't touch TIME_PY0's coverage of the digit glyphs at all -- most
-// likely giving the date line itself a bit more clearance above y=110
-// (e.g. nudging DATE_PY up) rather than changing where the time's own
-// clear region starts -- but that needs its own hardware-photo
-// verification before landing, not a blind guess.
-static const int32_t DATE_PY0 = LOCATION_PY + 40, DATE_PY1 = TIME_TEXT_Y - 5;
+// DATE_PY1 and TIME_PY0 still share the same formula (TIME_TEXT_Y - 5) --
+// see CLAUDE.md's "Known Open Issues" for the full history of why that
+// was a problem (date-line descenders slowly fading under the per-minute
+// clear) and why the first fix attempt (narrowing TIME_PY0's own coverage
+// of the digit glyphs) was reverted. The DATE_PY/TIME_TEXT_Y repositioning
+// above resolves it a different way -- by giving the date line enough real
+// clearance above this shared boundary that no descender should reach it
+// -- without touching TIME_PY0's digit coverage at all. Pending
+// confirmation on a fresh hardware photo before calling this closed.
+static const int32_t DATE_PY0 = DATE_PY - 10, DATE_PY1 = TIME_TEXT_Y - 5;
 static const int32_t TIME_PY0 = TIME_TEXT_Y - 5, TIME_PY1 = TIME_TEXT_Y + (int32_t)ui_font_medium_height + 5;
 static const int32_t WEATHER_PY0 = MAIN_TOP - 10, WEATHER_PY1 = LASTUPD_PY + 30;
 
