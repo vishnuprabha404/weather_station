@@ -297,6 +297,53 @@ without blanking what the others already know.
   than by each individual fetch function, since "do we have something worth
   displaying" is a property of the merge, not of any one source.
 
+## Known Bugs Fixed
+
+**Weather-changed redraw was silently crashing/rebooting the ESP32 instead
+of doing a real partial update (`renderer.cpp`'s `portraitFillRect()`).**
+Symptom on hardware: what looked like a *full-panel* refresh (whole screen
+flashes, header content settles first, then the icon/footer area flashes
+again, then everything settles) every ~10 minutes or whenever the weather
+actually changed — i.e. exactly the cadence and trigger of the background
+weather check, not of the real 6-hour anti-ghosting timer. That was the
+giveaway: nothing in the intentional full-refresh logic runs on a 10-minute
+cadence, so a full-refresh-*looking* event tied to weather changes had to be
+coming from somewhere else.
+
+Root cause: `drawWeatherPartial()` calls `drawWeatherValues(weather, NULL)`
+(no framebuffer — this is the partial-update path, meant to draw straight to
+the panel via `epd_draw_grayscale_image()`, which needs no framebuffer
+pointer). But `drawWeatherValues()` also redraws the footer's vertical
+divider via `portraitFillRect()`, which — unlike every bitmap-drawing helper
+in this file — unconditionally called `epd_fill_rect(..., fb)`. Confirmed by
+reading `epd_driver.c` directly: `epd_fill_rect()` → `epd_draw_vline()` →
+`epd_draw_pixel()` dereferences the `framebuffer` pointer with **no NULL
+check at all**, unlike the bitmap path which has a real hardware-direct
+fallback. So every single weather-changed redraw wrote through a null
+pointer, hard-faulted, and rebooted the chip — and what actually appeared on
+screen afterward was `setup()`'s own boot-time `doFullRefresh()`, a real
+full-panel redraw, which explains why it looked like "a full refresh" (it
+was one) tied to weather changes (the only thing that ever called the
+broken path).
+
+Fix: `portraitFillRect()` now branches like `drawPortraitBitmap()` already
+did — with a real `fb`, fill into it as before; with `fb == NULL`, build a
+tiny solid-color scratch buffer (4bpp, matching this project's own asset-
+packing convention — see "Asset Generation Pipeline") and push it directly
+via `epd_draw_grayscale_image()` instead. `renderer.cpp` needed two new
+includes it was previously getting away without (`<Arduino.h>` for
+`Serial`, `<stdlib.h>` for `malloc`/`free`) since — unlike `weather.cpp`/
+`weather_ec.cpp`/`weather_swob.cpp` — nothing else in this file transitively
+pulls in `Arduino.h` via `<WiFi.h>`.
+
+**Lesson for future partial-draw code in this file:** any drawing primitive
+called with `fb` potentially NULL needs an explicit hardware-direct branch
+— it is NOT safe to assume the driver's own functions no-op or degrade
+gracefully on a null framebuffer. Audit any *new* `epd_*` call added to a
+function that can be invoked from a partial-update path (i.e. anything
+reachable from `drawTimePartial()`/`drawDatePartial()`/
+`drawWeatherPartial()`) the same way before trusting it.
+
 ## Refresh Strategy — Actual Implementation
 
 This differs substantially from the original plan below (which only covered

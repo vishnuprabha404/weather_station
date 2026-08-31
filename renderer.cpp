@@ -5,7 +5,10 @@
 #include "epd_driver.h"
 #include "icons.h"          // pre-rotated icon bitmaps + big-digit font
 #include "portrait_font.h"  // pre-rotated alphanumeric UI fonts (regular + small)
+#include <Arduino.h>        // Serial -- not pulled in transitively here the way it is in
+                             // weather.cpp/weather_ec.cpp/weather_swob.cpp (via WiFi.h)
 #include <stdio.h>
+#include <stdlib.h>         // malloc/free -- see portraitFillRect()'s NULL-fb fallback
 #include <string.h>
 
 // ---- Core portrait placement primitive (verified against a ground-truth
@@ -32,9 +35,41 @@ static Rect_t portraitRectToNative(int32_t px0, int32_t py0, int32_t px1, int32_
   return { nx, ny, py1 - py0, px1 - px0 };
 }
 
+// BUG FIX (see CLAUDE.md's "Known Bugs Fixed" -- this one caused the whole
+// panel to appear to full-refresh on every weather change): epd_fill_rect()
+// -- and epd_draw_vline()/epd_draw_pixel() underneath it -- unconditionally
+// dereference `framebuffer` with no NULL check at all (confirmed by reading
+// epd_driver.c directly), unlike epd_draw_grayscale_image() which draws
+// straight to the panel and needs no framebuffer pointer. drawPortraitBitmap()
+// already accounts for this (fb ? copy-into-framebuffer : draw-direct-to-
+// hardware) but this function used to call epd_fill_rect(..., fb) even when
+// fb was NULL -- a guaranteed crash/reboot on every partial-update call site
+// that passes NULL (i.e. every weather-changed redraw, since
+// drawWeatherPartial() draws with fb=NULL by design). Fixed the same way
+// drawPortraitBitmap() handles it: build a tiny solid-color scratch buffer
+// and push THAT directly to the panel instead of writing into a null
+// framebuffer.
 static void portraitFillRect(int32_t px0, int32_t py0, int32_t px1, int32_t py1, uint8_t* fb) {
   Rect_t r = portraitRectToNative(px0, py0, px1, py1);
-  epd_fill_rect(r.x, r.y, r.width, r.height, 0, fb);
+  if (fb) {
+    epd_fill_rect(r.x, r.y, r.width, r.height, 0, fb);
+    return;
+  }
+  // 4bpp, 2px/byte, byte value 0x00 = both nibbles = 0 = black (matches this
+  // project's own asset-packing convention -- see CLAUDE.md's Asset
+  // Generation Pipeline section -- and epd_fill_rect's own color=0 meaning
+  // black, so this is a faithful direct-to-hardware equivalent of the
+  // fb-based fill above, not an approximation).
+  size_t rowBytes = (size_t)(r.width + 1) / 2;
+  size_t bytes = rowBytes * (size_t)r.height;
+  uint8_t* scratch = (uint8_t*)malloc(bytes);
+  if (!scratch) {
+    Serial.println("[renderer] portraitFillRect: scratch alloc failed, skipping this rect");
+    return; // skip rather than risk another NULL-framebuffer-style crash
+  }
+  memset(scratch, 0x00, bytes);
+  epd_draw_grayscale_image(r, scratch);
+  free(scratch);
 }
 
 static void toUpperInPlace(char* s) {
