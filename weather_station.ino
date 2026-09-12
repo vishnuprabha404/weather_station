@@ -10,8 +10,19 @@
 #include "weather.h"
 #include "weather_ec.h"
 #include "weather_swob.h"
+#include "bus_realtime.h" // deliberately NOT bus.h/bus_static.h -- see below
 #include "display.h"
 #include "renderer.h"
+
+// Cheap safety margin, kept even for this minimal realtime-only bus step:
+// this core's task stack defaults to 8192 bytes (confirmed by reading
+// main.cpp directly), which a full HTTPS+protobuf-decode call chain
+// (bus_realtime.cpp) can plausibly get close to even without touching
+// bus_static.cpp/miniz at all (that combination is what actually caused
+// the ~10KB+ single-frame overflow documented in CLAUDE.md's "Known Bugs
+// Fixed" -- not reachable from this minimal path, but this costs little
+// and buys real margin against a similar surprise elsewhere).
+SET_LOOP_TASK_STACK_SIZE(32768);
 
 static const char* TZ_STRING  = "EST5EDT,M3.2.0,M11.1.0"; // Sudbury, ON — handles EST/EDT
 static const char* NTP_SERVER = "pool.ntp.org";
@@ -38,6 +49,59 @@ static const unsigned long FULL_REFRESH_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL
 
 static int  lastRenderedMinute = -1;      // guards against firing twice in the same :01 window
 static char lastDrawnDateStr[32] = "";    // only redraw the date when this actually changes
+
+// --- Bus data: FIRST, deliberately minimal step (2026-09-11) --------------
+// The full bus module (bus.cpp/bus_static.cpp, static GTFS zip via miniz +
+// realtime merge + a whole "Next Buses" section) crashed on real hardware
+// twice over -- a stack overflow inside miniz's own decompression code
+// (needs ~10KB+ of stack on its own, more than this chip's entire default
+// 8KB task stack) and a heap-corruption bug from miniz defaulting to
+// internal-RAM allocations for a 4.78MB file. Both are root-caused and
+// fixed (see CLAUDE.md's "Known Bugs Fixed"), but rather than keep
+// debugging the full stack blind, this starts over small: ONE line of
+// text, realtime-feed-only (bus_realtime.cpp, no bus_static.cpp/miniz
+// involved at all -- so none of the above can even be reached from this
+// path), showing just the soonest upcoming bus at the FIRST configured
+// stop. No headsign, no static-schedule fallback for a blank route_id, no
+// multi-stop merge. Once this is confirmed working on real hardware, the
+// full module can be reintroduced deliberately, piece by piece.
+static const BusStopConfig NEXT_BUS_STOPS[BUS_STOP_COUNT] = BUS_STOPS_CONFIG; // config.h
+static char lastBusLine[48] = "";
+static unsigned long lastBusAttemptMs = 0;
+static const unsigned long BUS_INTERVAL_MS = (unsigned long)BUS_REFRESH_SECONDS * 1000UL; // config.h
+
+// Fetches the realtime feed (bus_realtime.cpp) and picks the single
+// soonest non-cancelled arrival at NEXT_BUS_STOPS[0], formatting it as one
+// line, e.g. "Next bus (11): 5 min". Returns false if the feed itself
+// failed OR simply had nothing for that stop right now -- caller decides
+// what to do (this project's convention: keep showing the last known line
+// rather than blanking it for a transient miss).
+static bool fetchNextBusLine(char* out, size_t outLen) {
+  static RealtimeCandidate candidates[BUS_MAX_REALTIME_CANDIDATES];
+  int count = 0;
+  if (!fetchRealtimeCandidates(NEXT_BUS_STOPS, BUS_STOP_COUNT, candidates, &count, BUS_MAX_REALTIME_CANDIDATES)) {
+    return false;
+  }
+
+  time_t nowEpoch = time(nullptr);
+  const RealtimeCandidate* best = nullptr;
+  for (int i = 0; i < count; i++) {
+    if (candidates[i].cancelled) continue;
+    if (strcmp(candidates[i].stopId, NEXT_BUS_STOPS[0].stopId) != 0) continue;
+    if (best == nullptr || candidates[i].epoch < best->epoch) best = &candidates[i];
+  }
+  if (best == nullptr) return false; // feed was fine, just nothing due at this stop right now
+
+  time_t epoch = best->stoppedNow ? nowEpoch : best->epoch;
+  long minutes = (long)((epoch - nowEpoch + 30) / 60); // round to nearest minute
+  if (minutes < 0) minutes = 0;
+  // route_id can be blank on the wire (tmix/Consat quirk -- see
+  // clauderef.md); no static schedule to fall back on in this minimal
+  // version, so just show "?" rather than an empty/misleading label.
+  const char* route = best->route[0] ? best->route : "?";
+  snprintf(out, outLen, "Next bus (%s): %ld min", route, minutes);
+  return true;
+}
 
 // Combines THREE independent sources into one WeatherData -- see the
 // comment above the struct in models.h for which fields each one owns:
@@ -218,9 +282,19 @@ void setup() {
   // ever misbehaves during its own setup.
   doFullRefresh();
 
+  // Minimal bus line -- best effort, drawn separately right after the full
+  // refresh above (drawFullScreen() itself is untouched -- see the comment
+  // on NEXT_BUS_STOPS for why this stays this simple for now).
+  if (fetchNextBusLine(lastBusLine, sizeof(lastBusLine))) {
+    Renderer::drawNextBusLine(lastBusLine);
+  } else {
+    Serial.println("[bus] no data yet at boot");
+  }
+
   unsigned long now = millis();
   lastWeatherAttemptMs = now;
   lastFullRefreshMs = now;
+  lastBusAttemptMs = now;
 
   initTouch(); // best-effort; touch navigation just stays disabled if this fails
 }
@@ -258,6 +332,7 @@ static void handleTouch() {
     Serial.println("[touch] back tapped -> home");
     currentPage = PAGE_HOME;
     doFullRefresh(); // redraw home with whatever's current now
+    Renderer::drawNextBusLine(lastBusLine); // doFullRefresh() doesn't draw this -- restore it separately
   }
 }
 
@@ -295,6 +370,27 @@ void loop() {
     }
   }
 
+  // Bus: checked every BUS_REFRESH_SECONDS (config.h -- much more often
+  // than weather, since a countdown is only useful if actually current),
+  // but only redrawn when the formatted line actually changed, same
+  // "check often, flash the panel only when it'd look different" idea
+  // weather already uses.
+  if (now - lastBusAttemptMs >= BUS_INTERVAL_MS) {
+    lastBusAttemptMs = now;
+    char newBusLine[48];
+    if (fetchNextBusLine(newBusLine, sizeof(newBusLine))) {
+      if (strcmp(newBusLine, lastBusLine) != 0) {
+        if (currentPage == PAGE_HOME) Renderer::drawNextBusLine(newBusLine);
+        strncpy(lastBusLine, newBusLine, sizeof(lastBusLine) - 1);
+        lastBusLine[sizeof(lastBusLine) - 1] = '\0';
+      } else {
+        Serial.println("[bus] no visible change since last check, skipping redraw");
+      }
+    } else {
+      Serial.println("[bus] fetch failed or nothing due right now, keeping last shown line");
+    }
+  }
+
   // Everything below only touches the home screen's own display, so skip
   // it while the daily page is showing — otherwise a minute-tick partial
   // refresh would scribble into daily-page screen space that means
@@ -304,6 +400,7 @@ void loop() {
       lastFullRefreshMs = now;
       Serial.println("[main] periodic full refresh (anti-ghosting)");
       doFullRefresh();
+      Renderer::drawNextBusLine(lastBusLine); // doFullRefresh() doesn't draw this -- restore it separately
     }
 
     // Clock tick: driven by the REAL clock's seconds, not a millis()

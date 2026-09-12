@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <time.h>
 
 // Three independent sources feed this struct (see fetchAllWeather() in
 // weather_station.ino for the merge): SWOB (weather_swob.cpp) owns
@@ -47,4 +48,62 @@ struct WeatherData {
   float windMaxKph = 0;
   char  sunrise[8] = "--:--";       // "HH:MM" (24h)
   char  sunset[8]  = "--:--";       // "HH:MM" (24h)
+};
+
+// --- Bus data (GOVA Transit, Greater Sudbury -- via Consat/tmix's GTFS
+// feeds) -----------------------------------------------------------------
+// Ported from the user's existing bus-stop project (backend/gova_next_bus.py
+// and its Kotlin/GNOME ports) rather than a new pipeline built from scratch,
+// per this project's original "reuse existing bus-data logic" goal -- see
+// CLAUDE.md's "Real-Time Bus Data" section and clauderef.md for the full
+// fetch/parse/merge strategy this feeds. bus.cpp owns the merge;
+// bus_static.cpp/bus_realtime.cpp own their one source each, same
+// one-file-per-source split as weather.cpp/weather_ec.cpp/weather_swob.cpp.
+
+#define BUS_MAX_ROUTES_PER_STOP   4
+#define BUS_MAX_ARRIVALS_PER_STOP 3
+
+// One configured stop to show on the dashboard: the next N buses serving
+// ANY of `routes` at `stopId`, merged and sorted together -- same shape as
+// gova_next_bus.py's STOPS list / the Kotlin port's Config.kt. Real values
+// live in config.h (gitignored), not here or in bus.cpp -- like
+// WEATHER_LATITUDE/LONGITUDE, a stop_id is location-identifying (which
+// street corner you actually catch a bus at), so it doesn't belong
+// hardcoded into a file this now-public repo ships.
+struct BusStopConfig {
+  const char* stopId;
+  const char* routes[BUS_MAX_ROUTES_PER_STOP]; // unused trailing slots are "" -- see routeCount
+  int routeCount;
+  const char* label;
+};
+
+// One upcoming bus at one configured stop, already reduced to what a
+// renderer would want -- no protobuf/CSV/HTTP types leak out of bus.cpp's
+// merge step into this struct, same separation weather.cpp/renderer.cpp
+// already keep.
+struct BusArrival {
+  char   route[16]      = "";    // e.g. "11", "1N" -- GOVA's are short; generous headroom for other agencies
+  char   headsign[32]   = "";    // trip destination text -- ALWAYS from the static schedule (the realtime
+                                  // feed carries no headsign field at all, only the static one does)
+  int    minutes         = 0;     // rounded ETA in minutes, clamped >= 0 -- see formatBusEta()
+  bool   live             = false; // true = backed by the realtime feed for THIS trip, false = static-schedule-only guess
+  int    delayMin         = 0;     // +late / -early vs. schedule, from the realtime feed; 0 if unknown/on-time
+  bool   hasScheduledTime = false; // true if a static-schedule baseline time ALSO exists for this same
+                                   // trip+day (see bus.cpp's merge) -- lets a renderer show both the
+                                   // original scheduled clock time and the live delay together, rather
+                                   // than the live update silently overwriting the scheduled time
+  time_t epoch            = 0;     // the time actually used for sorting/ETA (live if available, else scheduled)
+  time_t scheduledEpoch   = 0;     // only meaningful when hasScheduledTime is true
+};
+
+struct BusStopResult {
+  char stopId[16] = "";
+  char label[40]  = "";
+  BusArrival arrivals[BUS_MAX_ARRIVALS_PER_STOP];
+  int  arrivalCount = 0;
+  bool realtimeOk   = false; // true if tripupdates.pb was reachable AND fresh THIS cycle -- independent of
+                             // whether it had anything for THIS particular stop (see bus_realtime.h)
+  bool hasAnyData   = false; // true if EITHER the realtime feed or the static schedule contributed
+                             // anything at all for this stop -- what a renderer should check before
+                             // showing "no data" instead of an empty arrivals list
 };

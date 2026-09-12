@@ -1,0 +1,25 @@
+# Nanopb generator options for gtfs-realtime-trimmed.proto.
+# String fields need a fixed max_size (nanopb refuses to generate otherwise);
+# these are processed one entity/stop_time_update at a time (see bus.cpp), so
+# a small per-field buffer is fine even though it's reused across a whole
+# city feed -- generous headroom over GOVA's actual observed IDs ("1910",
+# "11", "1N", etc.), enough to be resilient to a different agency's format.
+transit_realtime.TripDescriptor.trip_id            max_size:24
+transit_realtime.TripDescriptor.route_id           max_size:16
+transit_realtime.TripUpdate.StopTimeUpdate.stop_id max_size:16
+transit_realtime.VehiclePosition.stop_id           max_size:16
+
+# The one field that's genuinely unbounded (a trip can have dozens of
+# stop_time_update rows; a feed can have many trips) -- decoded/filtered
+# row-by-row via bus.cpp's decodeStopTimeUpdate() instead of ever
+# materializing a full array. See FeedMessage.entity below for why THAT
+# stays a fixed array despite also being repeated.
+transit_realtime.TripUpdate.stop_time_update type:FT_CALLBACK
+
+# Deliberately NOT FT_CALLBACK: with stop_time_update (above) already a
+# callback, each FeedEntity element is small and fixed-size, so decoding the
+# whole entity array in one pb_decode() call (into a max_count-sized static
+# array) is simpler and safer to get right without a compiler than a second
+# level of nested callbacks -- see FEED_MAX_ENTITIES in bus.cpp for the max
+# count and the memory-budget reasoning behind it.
+transit_realtime.FeedMessage.entity max_count:200

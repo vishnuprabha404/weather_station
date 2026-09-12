@@ -1,0 +1,108 @@
+// Trimmed subset of the official GTFS-Realtime schema
+// (https://github.com/google/transit/blob/master/gtfs-realtime/proto/gtfs-realtime.proto,
+// package transit_realtime) -- only the messages/fields this project's
+// bus.cpp actually reads. Field numbers below are copied verbatim from the
+// official schema so this decodes real-world feeds correctly; protobuf wire
+// format safely ignores any field NOT declared here (that's the whole point
+// of the format), so trimming is 100% safe, not a compatibility risk -- it
+// just keeps the generated nanopb structs small enough for an ESP32's RAM
+// budget instead of also allocating space for Alert/Shape/TripModifications/
+// experimental fields this project never looks at.
+//
+// Regeneration: see gtfs-realtime.options alongside this file, and the
+// pipeline notes in CLAUDE.md's "Asset Generation Pipeline" section (this
+// follows the same "checked-in generated file, regenerate by hand when
+// needed" convention as icons.h/portrait_font.h).
+syntax = "proto2";
+package transit_realtime;
+
+message FeedHeader {
+  // Server-time the feed was generated, POSIX epoch seconds. Used only for
+  // the "is this feed stale?" check (see REALTIME_MAX_AGE in bus.cpp) --
+  // gtfs_realtime_version/incrementality from the real schema aren't read
+  // anywhere in this project, so both are omitted here.
+  optional uint64 timestamp = 3;
+}
+
+message TripDescriptor {
+  optional string trip_id = 1;
+  optional string route_id = 5;
+
+  // Real schema has ADDED/REPLACEMENT/DUPLICATED/NEW too; only CANCELED and
+  // DELETED are actually branched on (see realtime_candidates() in
+  // gova_next_bus.py) but the full enum is kept so a value we don't
+  // specifically check still decodes instead of erroring.
+  enum ScheduleRelationship {
+    SCHEDULED   = 0;
+    ADDED       = 1;
+    UNSCHEDULED = 2;
+    CANCELED    = 3;
+    REPLACEMENT = 5;
+    DUPLICATED  = 6;
+    DELETED     = 7;
+    NEW         = 8;
+  }
+  optional ScheduleRelationship schedule_relationship = 4;
+}
+
+message TripUpdate {
+  message StopTimeEvent {
+    optional int32 delay = 1;
+    optional int64 time  = 2;
+  }
+
+  message StopTimeUpdate {
+    optional string stop_id = 4;
+    optional StopTimeEvent arrival   = 2;
+    optional StopTimeEvent departure = 3;
+
+    enum ScheduleRelationship {
+      SCHEDULED   = 0;
+      SKIPPED     = 1;
+      NO_DATA     = 2;
+      UNSCHEDULED = 3;
+    }
+    optional ScheduleRelationship schedule_relationship = 5;
+  }
+
+  optional TripDescriptor trip = 1;
+  // Can be dozens of rows per trip across a whole city's worth of trips in
+  // one feed -- FT_CALLBACK (see .options) so this is filtered/discarded
+  // row-by-row during decode instead of ever materializing a full array.
+  repeated StopTimeUpdate stop_time_update = 2;
+}
+
+message Position {
+  optional float latitude  = 1;
+  optional float longitude = 2;
+}
+
+message VehiclePosition {
+  optional TripDescriptor trip = 1;
+  optional Position position   = 2;
+  optional string stop_id      = 7;
+
+  enum VehicleStopStatus {
+    INCOMING_AT   = 0;
+    STOPPED_AT    = 1;
+    IN_TRANSIT_TO = 2;
+  }
+  optional VehicleStopStatus current_status = 4 [default = IN_TRANSIT_TO];
+}
+
+message FeedEntity {
+  optional TripUpdate trip_update   = 3;
+  optional VehiclePosition vehicle  = 4;
+  // id/is_deleted/alert/shape/stop/trip_modifications from the real schema
+  // are never read by this project -- omitted, not just unused.
+}
+
+message FeedMessage {
+  optional FeedHeader header = 1;
+  // Fixed-count (see .options), NOT callback: this stays one flat array
+  // decoded in a single pb_decode() call, since (unlike stop_time_update
+  // above) nothing nested under FeedEntity is unboundedly large once
+  // stop_time_update is itself a callback field -- see bus.cpp's comment
+  // on FEED_MAX_ENTITIES for the actual size budget/reasoning.
+  repeated FeedEntity entity = 2;
+}

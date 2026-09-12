@@ -316,6 +316,19 @@ static const int32_t WEATHER_PY0 = MAIN_TOP - 10, WEATHER_PY1 = LASTUPD_PY + 30;
 // Daily-page back button, in PORTRAIT space.
 static const int32_t BACK_PX0 = 20, BACK_PY0 = 20, BACK_PX1 = 170, BACK_PY1 = 80;
 
+// --- Next-bus line (added 2026-09-11 as a deliberately small first step --
+// see CLAUDE.md's "Known Bugs Fixed"/"Planned UI": the full bus module's
+// static-schedule path crashed on real hardware (miniz needing far more
+// stack than this chip's default task stack, plus a large PSRAM-vs-
+// internal-RAM allocator bug), so this starts with just ONE realtime-only
+// line instead of the whole "Next Buses" section, to get *something*
+// working end-to-end on real hardware first.
+// Sits in the free space between "Feels like ..." (ends ~y=445) and the
+// footer divider (FOOTER_DIV_PY=610) -- plenty of room for one more line.
+static const int32_t NEXTBUS_PY = 460;
+static const int32_t NEXTBUS_REGION_PY0 = NEXTBUS_PY - 8;
+static const int32_t NEXTBUS_REGION_PY1 = NEXTBUS_PY + (int32_t)ui_font_height + 10;
+
 // ---- Time: per-character "slot" layout for cheap digit-only partial
 // refresh, drawn in the larger medium (50px) font, no border. The combo
 // string is always the fixed shape "HH:MM AP MTZT" (12 chars, e.g.
@@ -483,6 +496,15 @@ void Renderer::drawWeatherPartial(const WeatherData &weather) {
   epd_poweron();
   epd_clear_area(portraitRectToNative(MARGIN - 10, WEATHER_PY0, PORTRAIT_W - MARGIN + 10, WEATHER_PY1));
   drawWeatherValues(weather, NULL);
+  epd_poweroff();
+}
+
+void Renderer::drawNextBusLine(const char* text) {
+  epd_poweron();
+  epd_clear_area(portraitRectToNative(MARGIN - 10, NEXTBUS_REGION_PY0, PORTRAIT_W - MARGIN + 10, NEXTBUS_REGION_PY1));
+  if (text && text[0]) {
+    drawPortraitText(MARGIN, NEXTBUS_PY, text, NULL);
+  }
   epd_poweroff();
 }
 

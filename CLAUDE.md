@@ -3,14 +3,47 @@
 ## Project Status (read this first)
 
 **Weather + time + portrait display: DONE and running on real hardware.**
-**Bus/transit integration: DEFERRED, not started.**
+**Bus/transit: a minimal realtime-only "Next bus (ROUTE): N min" line is
+DONE and CONFIRMED WORKING on real hardware (2026-09-11).** The full
+module (static GTFS schedule + merge + a whole "Next Buses" section,
+`bus.cpp`/`bus_static.cpp`) is written and its real bugs are fixed, but is
+**currently NOT wired into the sketch** — deliberately parked in favor of
+the minimal version after repeated hardware crashes. See "Real-Time Bus
+Data" and "Known Bugs Fixed" below before touching any of this.
 
-The original plan targeted bus + weather + time together. Bus was deliberately
-deferred early on to get weather+time working end-to-end first; that milestone
-is now complete, including several rounds of on-hardware layout iteration and
-two features beyond the original plan (true portrait mode, and a
-change-only weather redraw). See "Next Immediate Task" at the bottom for
-where to pick this back up.
+The original plan targeted bus + weather + time together. Bus was
+deliberately deferred early on to get weather+time working end-to-end
+first; that milestone is complete, including several rounds of
+on-hardware layout iteration and two features beyond the original plan
+(true portrait mode, and a change-only weather redraw).
+
+Bus/transit came next, and went through a real journey worth understanding
+before continuing it:
+1. Built the full module (`bus.cpp`/`bus_static.cpp`/`bus_realtime.cpp` +
+   a "Next Buses" section replacing the old footer) — compiled clean, but
+   **crashed the board repeatedly** on its first real hardware tests.
+   Root-caused two real, since-fixed bugs (see "Known Bugs Fixed"): a
+   2016-byte stack frame in `bus.cpp`, and miniz (the zip library backing
+   the static GTFS schedule fetch) silently using this chip's tiny
+   internal SRAM instead of PSRAM for a 4.78MB file, corrupting the heap.
+2. Even with both fixed, getting a clean, confirmed-good hardware run
+   proved slow and hard to pin down with confidence (this board's
+   bootloader-entry-over-USB flakiness — see "Known toolchain gotchas" —
+   made every flash/test cycle its own small ordeal, independent of the
+   firmware itself).
+3. **Decision: stop debugging the full module blind and start smaller.**
+   Reverted `renderer.cpp`/`renderer.h`/`weather_station.ino` to the
+   proven pre-bus baseline (git commit before any of this), then added
+   back just ONE new thing: `Renderer::drawNextBusLine()` (one line of
+   text under the weather block) fed by a small `fetchNextBusLine()` in
+   `weather_station.ino` that calls `bus_realtime.cpp`'s realtime feed
+   *only* — no `bus_static.cpp`/miniz involved at all, so neither bug
+   above is even reachable from this path. **This is what's actually
+   flashed and confirmed working right now.**
+
+The full module's source is kept (not deleted) with both bugs fixed, for
+whenever this gets built back up incrementally — see "Next Immediate
+Task" for how to pick this up without repeating the same mistakes.
 
 **Actual project location:** `/home/vishnu/Documents/projects/weather_station/`
 (moved from its original `/home/vishnu/Documents/esp 32/weather_station/`
@@ -19,7 +52,10 @@ projects and out of a path with a space in it). Flat directory, not the
 `eink-dashboard-esp32/src/...` layout originally sketched below in
 "Suggested Firmware Structure" — that section is kept for historical
 context but the *actual* structure is documented in its own section
-further down. Git repo, pushed to a private GitHub remote.
+further down. Git repo, pushed to a **public** GitHub remote
+(`github.com/vishnuprabha404/weather_station` — flipped from private to
+public 2026-09-11; `config.h` confirmed never committed, in the full
+history, before that happened).
 
 ## Project Overview
 
@@ -27,7 +63,7 @@ Build a small, always-on home e-ink dashboard that displays:
 
 - Outside temperature / weather information — **done**
 - Current date/time — **done**
-- Nearby bus departure times (real-time, from a transit API — e.g. GO Transit / Metrolinx) — **not started**
+- Nearby bus departure times (real-time, from a transit API — **GOVA Transit**, Greater Sudbury's local agency, corrected from an initial GO Transit / Metrolinx guess — see "Real-Time Bus Data" below) — **data layer built (compiles clean, not yet hardware-verified); not yet rendered on screen — see "Planned UI"**
 - Potentially additional home-dashboard information later
 
 The project should be inexpensive, reliable, easy to maintain, and visually clean.
@@ -74,6 +110,7 @@ This board is the full compute + display unit.
 | Weather API | **Triple-source, split by field** — Environment Canada's **SWOB** real-time feed (`api.weather.gc.ca`, `swob-realtime` collection, HTTPS/JSON) for temp/feels-like/humidity/wind/last-updated (raw per-minute station telemetry — fresh enough to actually track the 10-minute check cadence); Environment Canada's **MSC GeoMet citypage** API (`citypageweather-realtime` collection) for just the condition text/icon (same station, but only updates hourly); **Open-Meteo** (plain HTTP/JSON, no API key) for the daily-overview page (high/low/precip%/sunrise-sunset) and `isDay`. See "Weather Data Sources" below for why it's split this way. |
 | E-paper driver | `LilyGo EPD47` Arduino library (`epd_driver.h`/`.c`) |
 | Touch driver | SensorLib's `TouchDrvGT911`, via the non-deprecated `TouchDrv.hpp` header |
+| Bus API | **GOVA Transit (Consat/tmix)** — GTFS-Realtime protobuf (`tripupdates.pb`/`vehiclepositions.pb`) via `Nanopb` 0.4.9.1, plus the static GTFS schedule zip (`gtfs.zip`) via `Miniz` 3.1.2 + a hand-written CSV parser. Both libraries manually vendored under `~/Arduino/libraries/`, not from Library Manager. See "Real-Time Bus Data" below. |
 | Config | `config.h` (gitignored) + checked-in `config.h.example` template |
 
 ## Portrait Mode — how it actually works (read before touching `renderer.cpp`)
@@ -165,23 +202,53 @@ Main block:
 - Condition text in **UPPERCASE** (source data is Title Case; uppercased at
   render time)
 - "Feels like X°C"
-
-Footer (2-column grid, vertical divider between):
-- Humidity (icon + label + value)
-- Wind (icon + label + speed + compass direction, 2 lines)
+- "Wind X km/h DIR" (added 2026-09-11, see below — used to be on its own
+  in a separate footer, now a second line right under feels-like)
 
 Bottom-left, small (20px) de-emphasized text: "Weather updated at HH:MM AM/PM"
-— deliberately pulled out of the footer grid (a 3-column footer with a "Last
-Update" cell was tried first and dropped per user feedback).
+— its own independently-refreshed line/region (see "Bus section" below for
+why that had to change), not part of the footer grid (a 3-column footer
+with a "Last Update" cell was tried first and dropped per user feedback,
+back when there still was a footer grid at all).
+
+**Bus section (added 2026-09-11, first pass, NOT yet hardware-verified —
+see "Planned UI"/"Real-Time Bus Data" → "Actual Implementation")**: the old
+Humidity | Wind 2-column footer (with its own divider) is **gone** —
+removed to make room for this. Humidity is not shown anywhere on this
+screen right now as a result (a known, deliberate, temporary gap until a
+dedicated Weather tab exists — see "Planned UI"). In its place: a divider,
+a "NEXT BUSES" label (with a small new bus icon — `bus_icons.h`, kept
+separate from `icons.h` since that file's own generator no longer exists
+anywhere, see its header comment), then one row per configured stop
+(`config.h`'s `BUS_STOPS_CONFIG`, currently 3): the stop's label, then up
+to 2 upcoming arrivals side by side (route, ETA via `formatBusEta()`, a
+`(+N)`/`(-N)` delay suffix only when live and actually delayed, and a
+12-hour clock time via `formatBusClock12h()`). A stop with no data at all
+shows "No data"; one with data but nothing upcoming shows "No upcoming
+buses" — both handled by `BusStopResult.hasAnyData`/`arrivalCount`, not
+special-cased in the renderer.
+
+This section is genuinely a first estimate, more so than the rest of this
+layout — it was designed against layout MATH (measured font heights /
+existing constants), not against a real photo yet, unlike everything else
+in this section which already went through that process. **Confirm
+against a real hardware photo before treating any of its pixel positions
+as settled** — row spacing, column width for the two side-by-side
+arrivals, and whether the small font's arrival lines actually fit without
+truncating/wrapping are all open questions until then.
 
 Tapping the main weather block navigates to a full-screen "Today's Overview"
 page (high/low, sunrise/sunset, max wind, precip chance) with a back button;
-this is always a full refresh, not partial (different layout entirely).
+this is always a full refresh, not partial (different layout entirely). The
+tappable zone is now just the compact weather block (not the bus section
+below it — there's no drill-down page for bus data yet, so it's
+intentionally non-interactive for now).
 
 Layout constants live at the top of `renderer.cpp` and were tuned against
 real hardware photos across several iterations — treat any specific pixel
 number there as "best current estimate, verified against at least one real
-photo," not as derived from first principles.
+photo," not as derived from first principles. **Exception: the bus-section
+constants (`BUS_*`) are pure estimates, not yet photo-verified — see above.**
 
 ## Weather Data Sources — why it's split across THREE APIs (read before touching `weather.cpp`/`weather_ec.cpp`/`weather_swob.cpp`)
 
@@ -344,6 +411,90 @@ function that can be invoked from a partial-update path (i.e. anything
 reachable from `drawTimePartial()`/`drawDatePartial()`/
 `drawWeatherPartial()`) the same way before trusting it.
 
+**Three real bugs found crashing the full bus module on its first real
+hardware tests (2026-09-11) — root-caused and fixed in the source, but the
+module was then parked in favor of a smaller working version rather than
+chasing a fourth. Read this before ever re-enabling `bus.cpp`/
+`bus_static.cpp`.**
+
+Symptom each time: the board appeared to "freeze" at a stale clock value
+forever (a photo showed a real but stale time that never advanced). E-ink
+retaining its last image made this look like a hang; it was actually a
+crash-reboot loop happening fast enough that no *new* full draw ever
+completed to overwrite the stale one — each reboot re-ran `setup()`, got
+partway through, crashed again. Diagnosis was entirely remote (no physical
+access to the board): confirmed it wasn't a genuine hang by polling
+`lsusb` every ~1.5s and watching the board's native-USB device
+(`303a:1001`) actually disappear and reappear (proof of real resets), then
+captured crash dumps by auto-reconnecting a raw serial read across those
+resets. Backtraces from a corrupted stack are useless (nanopb/miniz-era
+crashes showed `|<-CORRUPTED`), so root-causing leaned on
+`xtensa-esp32s3-elf-objdump` against a locally-built ELF with identical
+source (same toolchain, `arduino-cli` compiling the same on-disk files —
+build timestamp differs so the printed "ELF SHA256" never matches, but
+code addresses do) to read real `entry a1, N` stack-frame sizes (Xtensa's
+prologue opcode) instead of guessing from `sizeof()`.
+
+1. **`bus.cpp`'s `buildStopResult()` had a 2016-byte stack frame** — by
+   far the largest anything in this project had put on the stack — from
+   `StaticCandidate staticCands[BUS_MAX_STATIC_CANDIDATES]` being a plain
+   stack-local array. The comment on its neighbor, `merged`, already
+   explained why arrays this size need `static` instead; that reasoning
+   just wasn't applied to `staticCands` too. **Fix:** made it `static`.
+   Confirmed via disassembly: the frame shrank enough for the compiler to
+   fully inline the function into `fetchAllBuses()` (192 bytes combined).
+2. **miniz defaults to plain `malloc()`/internal SRAM for every
+   allocation** (confirmed by reading `mz_zip_reader_init_internal()`/
+   `mz_zip_reader_extract_to_heap()` directly) unless its archive's
+   `m_pAlloc`/`m_pFree`/`m_pRealloc` are set explicitly — which
+   `bus_static.cpp` never did. GOVA's real `stop_times.txt` decompresses
+   to **~4.78MB** (confirmed by actually downloading and unzipping the
+   real feed, not estimated) — wildly larger than this chip's few hundred
+   KB of internal SRAM. The failed/degenerate allocation corrupted the
+   heap badly enough to crash *later*, in a completely unrelated place
+   (the WiFi driver's own packet-receive path, mid-allocation) — a classic
+   "crash site is the victim, not the cause" signature; the giveaway was
+   the faulting address `0x0a0a000b` — `0x0a` is literally the ASCII
+   newline character, pointing straight at CSV text overwriting something
+   it shouldn't. **Fix:** `zipPsramAlloc`/`zipPsramFree`/`zipPsramRealloc`
+   (bus_static.cpp) route every miniz allocation through
+   `heap_caps_malloc(..., MALLOC_CAP_SPIRAM)` instead, set on the archive
+   *before* `mz_zip_reader_init_mem()`.
+3. **miniz's own internal decompression routine needs far more stack than
+   this chip's entire default task stack.** Even after fixes 1-2, the
+   board kept crash-looping — sometimes the same heap-corruption
+   signature, sometimes an explicit `***ERROR*** A stack overflow in task
+   loopTask has been detected`. `xtensa-esp32s3-elf-objdump` on
+   `mz_zip_reader_extract_to_mem_no_alloc1$part$8` showed a **9632-byte
+   single stack frame** (real DEFLATE decompression state), on top of
+   ~1200 more in its caller — comfortably more than this Arduino core's
+   entire default 8192-byte task stack (confirmed by reading `main.cpp`
+   directly), regardless of anything in this project's own code. Not
+   fixable inside miniz's logic; the standard Arduino-ESP32 fix is
+   `SET_LOOP_TASK_STACK_SIZE(32768)` (a real macro this core's `Arduino.h`
+   provides for exactly this) at file scope in `weather_station.ino`.
+
+**All three are fixed in the source** (`bus.cpp`, `bus_static.cpp`,
+`weather_station.ino`'s `SET_LOOP_TASK_STACK_SIZE`), verified individually
+via disassembly/direct source reading, **but the full module with all
+three fixes together was never actually confirmed clean on real
+hardware** — getting a trustworthy multi-minute hardware run proved slow
+given this board's separate, compounding bootloader-entry flakiness (see
+"Known toolchain gotchas"), and rather than keep debugging blind, the
+decision was made to fall back to a much smaller working version instead
+(see "Project Status" above). Anyone re-enabling `bus.cpp`/
+`bus_static.cpp` should re-verify all three fixes are still in place and
+get a real multi-minute clean hardware run before trusting it.
+
+**Lesson for any future bus/renderer code:** the "must be `static`, never
+a stack local" rule (see `StaticSchedule`'s own comment in bus_static.h)
+applies to *any* array whose element count × element size gets into the
+hundreds of bytes — audit this explicitly for new code, don't assume "I
+already did the big ones." And for any third-party library pulled in
+later: check its actual stack/allocation behavior (objdump the real
+`entry` sizes, grep for its own default allocator) rather than assuming
+it's well-behaved by default.
+
 ## Known Open Issues
 
 **Date-line descenders slowly fading, caused by the minute-tick clear
@@ -424,6 +575,22 @@ compass label, not raw degrees) so a fetch that changes only in ways too
 small to see never triggers a redraw. This decouples "how often we poll the
 API" from "how often we flash the e-ink."
 
+### Bus (added 2026-09-11)
+**Fetched** every `BUS_REFRESH_SECONDS` (currently 60, in `config.h`) —
+much more often than weather, since a bus countdown is only useful if it's
+actually current. But the panel is only **redrawn** when BOTH
+`busDisplayChanged()` (bus.cpp — same display-precision idea as weather's,
+comparing route/minutes/live-status/delay) says something would look
+different, AND a separate `BUS_REDRAW_INTERVAL_MS` throttle (currently 5
+minutes, in `weather_station.ino`) has elapsed. That second throttle is
+new/different from weather's model: a live countdown ticks down almost
+every single fetch even when nothing about the underlying schedule/
+realtime actually changed, so `busDisplayChanged()` alone would fire a
+redraw nearly every 60-second cycle — a much more aggressive partial-
+refresh pattern than anything else in this project. The extra throttle
+caps how often the panel actually flashes for bus data specifically,
+independent of both the fetch cadence and weather's own redraw cadence.
+
 ### Full refresh (anti-ghosting)
 Independent 6-hour timer (`FULL_REFRESH_INTERVAL_MS`), unrelated to the
 above — partial refresh never fully "cleans" an e-ink panel, so ghosting
@@ -436,20 +603,275 @@ already gotten visibly bad, not part of the routine cycle).
 Always a full refresh (different layout entirely from the home screen), on
 tap only.
 
-## Real-Time Bus Data — Feasibility (Confirmed Doable, not yet started)
+## Real-Time Bus Data — Feasibility + Actual Implementation
 
-Real-time transit API polling over Wi-Fi from an ESP32-S3 is proven and well-supported:
+### ⚠️ Agency correction (2026-09-11): GOVA Transit, not GO Transit/Metrolinx
 
-1. ESP32-S3 connects to Wi-Fi (built-in radio).
-2. `HTTPClient` makes a periodic HTTPS GET request to the transit API (target: GO Transit / Metrolinx).
-3. `ArduinoJson` parses the JSON response.
-4. Parsed departure times are stored in a small in-memory struct.
-5. Renderer draws departures to the e-paper display.
-6. Repeats on the refresh interval (target: every 1 minute for bus data).
+The original plan (and every mention below of "GO Transit / Metrolinx") was
+an initial guess made before the user's actual local transit data was
+investigated. It was **wrong**. The user's existing Android widget and GNOME
+extension — the ones this project's goal already says to reuse rather than
+build a second pipeline — are for **GOVA Transit (Greater Sudbury, Ontario)**,
+an unrelated agency with an unrelated feed (Android package is literally
+`com.sudburybus.busstop`). This lines up with `config.h.example`, which
+already uses Greater Sudbury as its worked example. GO Transit/Metrolinx is
+**not** the target agency for this project; treat any remaining "GO
+Transit / Metrolinx" text below/elsewhere in this file as superseded
+historical context, not a live instruction.
 
-**Open item to verify before writing firmware:** confirm whether the GO Transit / Metrolinx public API returns plain JSON (straightforward with ArduinoJson) or GTFS-Realtime protobuf (binary — would need the `nanopb` library and more parsing work). Check official Metrolinx developer docs for the exact endpoint/auth method before building the `bus` module.
+This was confirmed by asking the Claude Code session in the user's Android
+widget project directly (relayed by the user, not fetched independently by
+this project) and cross-checking its answer against that project's actual
+source (`backend/gova_next_bus.py`, `android/.../data/BusRepository.kt`,
+`android/.../data/Config.kt`, `android/app/build.gradle.kts`), not taken on
+faith. Full detail is preserved in `clauderef.md` (checked into this repo,
+no secrets in it — the feed needs no API key) — read that file before
+writing `bus.cpp`, don't re-derive any of this from scratch:
+
+- **Endpoints (GOVA / Consat-tmix, no auth needed — just a `User-Agent`
+  header):**
+  `https://sudbury.tmix.se/gtfs/gtfs.zip` (static schedule, CSVs in a zip),
+  `https://sudbury.tmix.se/gtfs-realtime/tripupdates.pb` and
+  `.../vehiclepositions.pb` (real-time, binary).
+  **These specific URLs and the "no auth" fact are GOVA/tmix-specific —
+  don't assume either transfers to a different agency if this ever
+  changes.**
+- **Real-time format is GTFS-Realtime protobuf, not JSON** — the standard
+  `gtfs-realtime.proto` schema (https://gtfs.org/realtime/reference/), so
+  this is agency-agnostic. This means `ArduinoJson` does **not** apply to
+  the real-time feed; plan on the `nanopb` library plus real binary
+  parsing (a `.proto`-generated `FeedMessage` → repeated `FeedEntity` →
+  `TripUpdate`/`StopTimeUpdate` or `VehiclePosition`). The static GTFS zip
+  side is plain CSV (`trips.txt`/`stops.txt`/`stop_times.txt`/
+  `calendar_dates.txt`) — friendlier, but watch for a leading UTF-8 BOM
+  (bit the Kotlin port once, silently) and mind ESP32 RAM/flash if holding
+  more than the filtered rows actually needed.
+- **Stop selection is a hardcoded config list** (`{stop_id, routes[],
+  label}`), not geolocation. This project ended up using GOVA's own
+  example three stops verbatim (`config.h`'s `BUS_STOPS_CONFIG`: `1910`/
+  Lasalle & Notre Dame, `1820`/1111 Notre Dame, `6205`/Lasalle) — the user
+  confirmed these are the real widget's actual stops, not placeholders, so
+  there was nothing to re-derive.
+- **Poll interval:** the GNOME extension uses 15s (aggressive, desktop
+  use), the Android widget 15min (WorkManager's practical floor); no rate
+  limiting observed at either. Something well under 15s is fine for an
+  e-ink dashboard — 30–60s, or tied to the display's own refresh cycle,
+  same "check often, redraw only on real change" discipline weather
+  already uses.
+- **Two portable lessons already paid for once, worth building in from the
+  start:** (1) treat the feed as stale/fall back to static schedule if
+  `FeedHeader.timestamp` is >10 minutes old — a frozen upstream feed
+  otherwise looks identical to a healthy one; (2) GTFS's post-midnight time
+  format (`"24:06:00"` etc.) needs matching against yesterday/today/
+  tomorrow, not just today/tomorrow, or anything active right after local
+  midnight silently fails to merge.
+- **`backend/gova_next_bus.py`** (~570 lines, fully commented, no secrets)
+  in the Android widget project is the reference implementation to port
+  the fetch/parse/merge shape from — see `clauderef.md` section 6 for the
+  exact steps.
 
 **HTTPS/TLS note:** ESP32's `HTTPClient` needs either a root CA certificate bundle for the API's HTTPS endpoint, or `setInsecure()` as a quick-start fallback (not recommended long-term). Confirm the API's cert chain when implementing. (Open-Meteo's weather integration still uses plain HTTP, so this remains unhandled there — but both Environment Canada integrations (`weather_ec.cpp`'s citypage feed and `weather_swob.cpp`'s SWOB feed) hit HTTPS endpoints, via `WiFiClientSecure` + `setInsecure()`, i.e. the quick-start fallback, not a pinned cert. Same trade-off will apply to the bus API whenever that's built — revisit all of these together if this ever needs to be hardened.)
+
+### Actual Implementation (2026-09-11) — built, compiles clean, NOT yet hardware-verified
+
+The full fetch/parse/merge data layer described above is written across three
+new files, following the same one-file-per-source split as the weather
+modules — `bus.cpp` never touches protobuf/CSV/HTTP types, same separation
+`renderer.cpp` keeps from `weather.cpp`:
+
+- **`bus_realtime.cpp`/`.h`** — fetches + decodes `tripupdates.pb` and
+  `vehiclepositions.pb` via nanopb.
+- **`bus_static.cpp`/`.h`** — fetches + parses the static `gtfs.zip`
+  (`trips.txt`/`stop_times.txt`/`calendar_dates.txt`) via miniz + a
+  hand-written RFC 4180 CSV parser (quoted-field/embedded-comma/`""`-escape
+  aware — verified correct by hand-tracing all three cases, not just the
+  simple unquoted case, since there was no compiler available at the time
+  to catch a subtle mistake there).
+- **`bus.cpp`/`.h`** — the merge (static seeds the candidate set, realtime
+  overlays/wins for the same trip+day, keeping the static time as
+  `scheduledEpoch`), day-anchoring, grace period, sort, take-next-N. Also
+  owns `formatBusEta()`.
+- **`models.h`** — `BusStopConfig` (config shape), `BusArrival`/
+  `BusStopResult` (render-agnostic output — no protobuf/CSV types leak
+  out, same discipline `WeatherData` keeps).
+- **`gtfs_realtime.pb.h`/`.pb.c`** — auto-generated nanopb bindings,
+  checked in (same "generated file, regenerate by hand when needed"
+  convention as `icons.h`/`portrait_font.h` — see that file's own header
+  comment for exact regeneration steps). Generated from a **deliberately
+  trimmed** subset of the official `gtfs-realtime.proto` (only the
+  messages/fields actually read — protobuf safely ignores anything not
+  declared, so this is safe, not a compatibility risk) — source kept at
+  `proto_src/gtfs-realtime-trimmed.proto` + `.options`.
+- **`~/Arduino/libraries/Nanopb/`** and **`~/Arduino/libraries/Miniz/`** —
+  vendored as real Arduino libraries (not checked into this repo, same as
+  ArduinoJson/LilyGo-EPD47/SensorLib/Button2) — nanopb 0.4.9.1 (runtime
+  only: `pb.h`/`pb_common`/`pb_decode`/`pb_encode`), miniz 3.1.2 (with
+  `MINIZ_NO_STDIO`/`MINIZ_NO_TIME`/`MINIZ_NO_ARCHIVE_WRITING_APIS`/
+  `MINIZ_NO_ZLIB_APIS`/`MINIZ_NO_ZLIB_COMPATIBLE_NAMES` enabled directly in
+  the vendored `miniz.h` — read-only zip access is all this project needs,
+  and disabling the zlib-compatible name layer removes a class of possible
+  symbol collisions against ESP-IDF's own bundled miniz, which this project
+  never calls into but the linker could otherwise see two definitions of).
+  **If this project is ever set up on a different machine, these two
+  libraries need to be reinstalled** — they aren't part of the git repo.
+
+**Memory-budget decisions (why the numbers in the code are what they are):**
+- `FeedMessage.entity` is a **fixed array** (`max_count:200` in the
+  `.options` file), not a callback — but `TripUpdate.stop_time_update` (the
+  one field that's genuinely unbounded — a trip can have dozens of stops,
+  a whole-city feed can have many trips) **is** `FT_CALLBACK`, decoded/
+  filtered row-by-row via a nested callback armed on every one of the 200
+  entity slots before the single `pb_decode()` call. This hybrid keeps the
+  decode simple (one call, plain array iteration afterward) while still
+  bounding memory on the one field that could otherwise blow up
+  (~200 entities × ~200 bytes ≈ 40KB, PSRAM-backed via
+  `heap_caps_malloc(..., MALLOC_CAP_SPIRAM)` — the same pattern
+  `display.cpp` already uses for the framebuffer, not a new convention).
+- The callback deliberately does **not** resolve which trip/route a
+  matched stop_time_update row belongs to at callback time — that would
+  require assuming the wire encodes `TripDescriptor` (tag 1) before
+  `stop_time_update` (tag 2), which is conventional but not
+  protobuf-spec-guaranteed. Instead it records just `{entityIndex, stopId,
+  epoch, delaySec}` and a second pass, run AFTER `pb_decode()` fully
+  returns, resolves `trip_id`/`route_id`/cancellation state — zero
+  assumptions about field order, at the cost of one extra pass.
+- `StaticSchedule` (`bus_static.h`) is **~42KB fully populated** (200
+  trips + 500 stop_times + 128 service dates) — **never** a stack local
+  anywhere in this code (would overflow a typical Arduino task stack);
+  always `static`/global, explicitly `memset`/field-reset instead of
+  relying on C++ in-class default member initializers (which don't run on
+  raw `malloc`'d/reinterpreted memory — only on true constructor-run
+  storage). This is the same reasoning nanopb's `FeedMessage` heap buffer
+  above needed.
+
+**Deliberate scope simplification vs. the Python reference**
+(`gova_next_bus.py`): this port does **not** parse `stops.txt` or track
+stop lat/lon. That data only ever fed (a) a `stop_name` fallback label —
+unneeded here since `BusStopConfig.label` (config.h) is always provided —
+and (b) the purely cosmetic "how far is the live-tracked vehicle from the
+stop" figure, which doesn't affect any arrival-time correctness (the thing
+that DOES affect correctness — a vehicle already `STOPPED_AT` the exact
+stop, overriding the predicted time — is kept, as `stoppedNow` in
+`bus_realtime.h`). One fewer CSV file, no lat/lon cross-referencing
+complexity, zero loss of anything that changes what time actually shows up
+on screen. Flagged here rather than silently dropped — see `bus_static.h`'s
+own comment too.
+
+**Verification performed (2026-09-11), all without real hardware:**
+- The full sketch (weather + time + portrait + this bus module) **compiles
+  clean** against the actual pinned toolchain — found the exact esp32 core
+  2.0.15 + xtensa-esp32s3 compiler already installed locally
+  (`~/.arduino15/packages/esp32/...`), installed `arduino-cli` to drive it,
+  and ran a real `arduino-cli compile`. Zero errors, zero warnings from any
+  of the new files (the only warnings anywhere are pre-existing, from
+  `LilyGo-EPD47`'s bundled zlib / `SensorLib`'s haptic driver / one
+  already-deprecated `getPoint()` call that predates this bus work).
+- **Partition scheme matters and was wrong by default**: arduino-cli's
+  default FQBN partition scheme is sized for 4MB flash (1.2MB app
+  partition) — this board's existing `icons.h` (751KB) + `portrait_font.h`
+  (537KB) alone already wouldn't fit in that, so the real Arduino IDE setup
+  must already be using something bigger. Recompiling with
+  `PartitionScheme=huge_app` (3MB app partition, appropriate for this
+  board's actual 16MB flash) gives **38% flash / 43% RAM** with the full
+  bus module included. **Open item: confirm in Arduino IDE's board menu
+  that Partition Scheme is actually set to Huge APP (or an equivalent
+  large-app 16MB scheme) before flashing** — if it's set to something
+  smaller, this won't fit.
+- What compiling does **NOT** verify: real network behavior (feed sizes
+  vs. `FEED_MAX_ENTITIES`/`BUS_MAX_REALTIME_CANDIDATES`/
+  `BUS_STATIC_MAX_TRIPS` etc. actually being enough headroom for GOVA's
+  real feed), whether tmix's HTTP responses actually send a normal
+  `Content-Length` (assumed by `fetchBinary()` in both new `.cpp` files —
+  logged as a clean failure if not, not a crash, but unverified against the
+  live endpoint), or any of the nanopb nested-callback decode logic against
+  real wire bytes. **Treat all of this as "reads correct, verified to
+  compile, never run" until proven otherwise on real hardware** — same
+  standard this file already holds other unverified work to (see "Known
+  Open Issues").
+
+## Planned UI — Multi-Screen Layout (mockup received 2026-09-11)
+
+The user sent a 4-screen mockup (`new layout.png`, in this repo) for the
+next round of display work — a genuine multi-screen app, not just a bus
+section bolted onto the existing single home screen. **Do not start
+building screens 2-4 without re-reading `new layout.png` directly first**
+— this section is a planning summary, not a pixel spec (this project's own
+"Actual Display Layout" section above shows how much real layout-constant
+tuning against hardware photos this kind of thing eventually needs).
+
+### Phase 1 decisions (made 2026-09-11) and status
+
+The user chose a phased approach rather than building all 4 screens at
+once — **Phase 1: a compact bus section added to the existing Home screen
+only**, no bottom nav, no tabs, no drill-down. **This is now built** (see
+"Actual Display Layout"'s "Bus section" and "Real-Time Bus Data" →
+"Actual Implementation") but **not yet confirmed on real hardware** —
+first-pass layout math only, same caveat as always in this file. Decisions
+made alongside that scope choice, all defaults were accepted:
+- Mockup's stop names ("Donovan College" etc.) were placeholder — kept the
+  real 3 configured stops (`BUS_STOPS_CONFIG`) as-is, just needed real
+  labels wired in where the mockup had example ones (done, matches
+  `config.h`).
+- Battery icon: drop it. Doesn't come up in Phase 1 (no new header chrome
+  was added — the existing header is untouched), but applies to any header
+  built in a later phase.
+- Favorites: skip entirely for Phase 1 (no "All Stops"/"Favorites" toggle
+  exists — there's no tabbed Bus Timings screen yet at all).
+
+Screens 2-4 (Bus Timings tab, Route detail drill-down, Weather tab) and the
+bottom nav bar are **still not built** — everything below this point is
+still a forward-looking plan for THOSE, not a status report on Phase 1.
+
+**The four screens**, tied together by a persistent bottom nav bar (Home /
+Bus Timings / Weather, each with an icon):
+1. **Home** — location+time header; a condensed current-weather block
+   (icon, big temp, feels-like, wind — no humidity/precip here); a "NEXT
+   BUSES" list with one card per configured stop, each showing its next TWO
+   arrivals side by side (minutes + delay-or-"ON TIME" badge + clock time);
+   a "Last updated" line with a refresh icon.
+2. **Bus Timings** (tab) — an "All Stops" / "Favorites" toggle, then the
+   same per-stop cards as Home but with each arrival as its own full-width
+   tappable row (implies tapping a row drills into screen 3).
+3. **Route detail** (drill-down, e.g. "Route 11: Donovan College →
+   Cambrian") — a "Next Bus" hero card, an "Upcoming Buses" list, and a
+   "Route Stops" section: an ordered, connected list of every stop on that
+   route (a transit-map-style vertical line with a dot per stop).
+4. **Weather** (tab) — big icon/temp/condition, feels-like + wind, and a
+   detail grid: Humidity, Precipitation, Pressure, Visibility.
+
+**Remaining mismatches for screens 2-4 — resolve before implementing,
+don't silently guess (the stop-name and battery-icon ones are RESOLVED,
+see "Phase 1 decisions" above; kept below for the still-open ones):**
+- **Pressure and Visibility (screen 4) aren't fetched by anything yet.**
+  `WeatherData` (models.h) has no field for either. Open-Meteo's API likely
+  has both in its `current` block (worth checking its docs when this is
+  built); SWOB may separately have station pressure. Needs a source
+  decision + a `weather.cpp`/`weather_swob.cpp` change before this screen
+  can show real numbers.
+- **Live precipitation % (screen 4) is currently a DAILY-only field.**
+  `precipProbabilityMax` (models.h) is explicitly the tap-through daily
+  overview's number, sourced once and not intended as a "right now" figure.
+  Screen 4 wants it on the main weather tab instead/as well — needs either
+  a second field or a repurposing decision, not just wiring the existing
+  one in unchanged.
+- **"Route Stops" (screen 3) needs the FULL ordered stop sequence for a
+  route** — not just the ~3 configured stops. `bus_static.cpp`'s
+  `stop_times.txt` parse currently filters down to ONLY rows matching a
+  configured `stop_id` (that's what keeps it small/RAM-friendly — see
+  "Actual Implementation" above). Building this screen means either
+  capturing `stop_sequence` + widening that filter to "every stop_time row
+  for any trip on a watched route" (bigger, but still bounded to a handful
+  of routes, not the whole city), or a separate, purpose-built fetch. A
+  real sizing/architecture decision for whenever this screen gets built,
+  not a small tweak.
+- **Per-arrival route badges**: `BusArrival.route` (models.h) already
+  carries the route id, so screens that want to show it per-row (a stop
+  served by multiple configured routes) need no data-layer change — it's
+  already there, just not drawn today.
+
+None of the above blocks continuing other work — they're flagged so
+whoever builds this (with `new layout.png` open) resolves them
+deliberately instead of guessing mid-implementation.
 
 ## Reliability Requirements — status
 
@@ -462,7 +884,7 @@ Handled gracefully, without crashing the firmware:
 - ✅ Missing cached data on first boot — `WeatherData.valid` defaults false; renderer shows "Waiting for first weather update..." instead of zeros
 - ⚠️ E-ink refresh failure — not programmatically catchable via the driver API; mitigated by the routine refresh cadence self-correcting any one-off glitch (acceptable, unchanged from original plan)
 - ✅ Device reset/power cycle — `setup()` does an immediate full draw with whatever data is available, so the display repopulates within one boot+fetch cycle
-- ⬜ Bus API unavailable — not applicable yet, bus not started
+- ✅ Bus API/feed unavailable — `fetchRealtimeCandidates()`/`ensureStaticSchedule()` (bus_realtime.cpp/bus_static.cpp) each return `false` on failure and leave prior data untouched; `fetchAllBuses()` (bus.cpp) only needs ONE of the two sources to have anything for a given stop to report data — same "any success counts" contract as weather. **Written and compiles clean; not yet exercised against the real feed on real hardware** — see "Real-Time Bus Data" → "Actual Implementation" for exactly what's unverified.
 
 If a request fails:
 1. Keep the last valid in-memory data. **Done.**
@@ -481,10 +903,15 @@ sketch folder alongside the `.ino` — no separate build system):
 
     weather_station/
     ├── weather_station.ino   — setup()/loop(), WiFi, NTP, touch init, page
-    │                           state machine, all scheduling/timing logic
-    ├── config.h              — gitignored, real WiFi creds + location + refresh interval
+    │                           state machine, all scheduling/timing logic,
+    │                           PLUS the minimal fetchNextBusLine() (calls
+    │                           bus_realtime.h directly) — see "Project Status"
+    │                           for why this lives here and not in bus.cpp
+    ├── config.h              — gitignored, real WiFi creds + location + bus stops + refresh intervals
     ├── config.h.example      — checked-in template
-    ├── models.h              — WeatherData struct
+    ├── models.h              — WeatherData, BusStopConfig/BusArrival/BusStopResult structs
+    │                           (BusArrival/BusStopResult currently unused --
+    │                           belong to the parked full module, bus.h/bus.cpp)
     ├── weather.h / .cpp      — fetchWeather() (Open-Meteo: daily page + isDay),
     │                           windDirectionToCompass(), formatTime12h(),
     │                           weatherDisplayChanged()
@@ -495,22 +922,78 @@ sketch folder alongside the `.ino` — no separate build system):
     │                           Canada SWOB: temp/feels-like/humidity/wind/
     │                           lastUpdated, the fresher per-minute source) —
     │                           see "Weather Data Sources" above
+    ├── bus_realtime.h / .cpp — fetchRealtimeCandidates() (tripupdates.pb +
+    │                           vehiclepositions.pb via nanopb) -- the ONE bus
+    │                           module actually called right now (from the
+    │                           .ino directly, not through bus.cpp)
+    ├── bus.h / .cpp          — fetchAllBuses() (merge: static + realtime,
+    │                           day-anchoring, grace/sort/take-N),
+    │                           formatBusEta() -- PARKED, not currently called
+    │                           from anywhere (see "Project Status"/"Known Bugs
+    │                           Fixed") -- still compiled (Arduino builds every
+    │                           .cpp in the sketch folder regardless), just unused
+    ├── bus_static.h / .cpp   — ensureStaticSchedule() (GOVA's gtfs.zip via
+    │                           miniz: trips/stop_times/calendar_dates CSVs,
+    │                           filtered to configured stops/routes only) --
+    │                           PARKED, same as bus.h/.cpp -- this is the file
+    │                           with the two miniz bugs (now fixed in-source,
+    │                           never confirmed together on real hardware)
+    ├── gtfs_realtime.pb.h/.c — auto-generated nanopb bindings (trimmed GTFS-RT
+    │                           schema), see "Real-Time Bus Data" above
+    ├── proto_src/            — the trimmed .proto + .options gtfs_realtime.pb.h/.c
+    │                           was generated from (regeneration source, not compiled)
+    ├── clauderef.md          — reference doc from the user's Android widget
+    │                           project's Claude session (GOVA API details);
+    │                           informational, not compiled
+    ├── new layout.png        — the 4-screen UI mockup, see "Planned UI" above
+    │                           (still just a future plan -- nothing built from
+    │                           it is currently wired in; see "Project Status")
+    ├── bus_icons.h           — auto-generated bus icon bitmap, SEPARATE from icons.h
+    │                           (that file's own generator no longer exists anywhere
+    │                           on this machine — see bus_icons.h's own header
+    │                           comment) -- currently unused (belongs to the
+    │                           parked Phase-1 "Next Buses" section, not the
+    │                           minimal line actually in use)
+    ├── assets_src/           — gen_bus_icon.py, the durable regeneration source for
+    │                           bus_icons.h (icons.h/portrait_font.h's own generators
+    │                           were never saved anywhere this durable — don't repeat
+    │                           that mistake for any future asset)
     ├── display.h / .cpp      — thin wrapper: init/framebuffer/clearBuffer/fullRefresh
-    ├── renderer.h / .cpp     — all drawing; portrait coordinate math lives here
+    ├── renderer.h / .cpp     — all drawing; portrait coordinate math lives here.
+    │                           Back to the proven pre-bus layout PLUS one small
+    │                           addition, drawNextBusLine() -- one plain text line
+    │                           under the weather block, independently partial-
+    │                           refreshed. This is CONFIRMED WORKING on real
+    │                           hardware (2026-09-11). The old footer-replacing
+    │                           "Next Buses" section this file grew earlier the
+    │                           same day is NOT part of the current renderer.cpp
+    │                           (reverted) -- its design is preserved above under
+    │                           "Actual Display Layout"/"Planned UI" for whenever
+    │                           the full module comes back, but don't assume it
+    │                           matches the code on disk right now
     ├── icons.h               — auto-generated (~750KB), see "Asset Generation Pipeline"
     └── portrait_font.h       — auto-generated (~540KB), see "Asset Generation Pipeline"
 
-This is flatter than the `src/`-based layout originally sketched for the
-bus+weather combined project — reasonable to keep flat for now; revisit if
-the bus module makes the folder too cluttered.
+Still flatter than the `src/`-based layout originally sketched for the
+bus+weather combined project, but no longer trivially so now that bus has
+6 files of its own (3 modules × .h/.cpp) plus generated/reference material
+— revisit if the "Planned UI" work adds much more.
+
+Two Arduino libraries this project depends on are **not** part of this git
+repo (same as ArduinoJson/LilyGo-EPD47/SensorLib/Button2, all externally
+installed): **Nanopb** 0.4.9.1 and **Miniz** 3.1.2, both manually installed
+under `~/Arduino/libraries/` (not from Library Manager — see "Real-Time Bus
+Data" → "Actual Implementation" for exact versions/config and why). If this
+project is ever set up on a different machine, these need reinstalling too.
 
 ## Configuration
 
-Do not hard-code API keys, Wi-Fi credentials, or private endpoints. Kept in
-`config.h` (gitignored — though note: **this isn't a git repo yet**, so
-"gitignored" is currently just a convention to honor if/when `git init`
-happens, not an enforced protection). Checked-in `config.h.example` shows
-the expected shape.
+Do not hard-code API keys, Wi-Fi credentials, or private endpoints, or
+anything location-identifying (a stop_id counts — see below). Kept in
+`config.h`, which is genuinely gitignored and confirmed never committed
+(this repo is now public on GitHub — see "Project Status"/git history, so
+this actually matters, not just a convention). Checked-in `config.h.example`
+shows the expected shape.
 
 Current fields: `WIFI_SSID`, `WIFI_PASSWORD`, `WEATHER_LATITUDE`,
 `WEATHER_LONGITUDE`, `WEATHER_LOCATION_NAME`, `WEATHER_EC_SITE_ID`
@@ -521,7 +1004,10 @@ humidity/wind — same physical station as `WEATHER_EC_SITE_ID` but a
 different identifier format; see "Weather Data Sources"),
 `WEATHER_REFRESH_MINUTES` (background check cadence — see "Refresh
 Strategy" for why this is no longer the same thing as "how often the
-screen updates").
+screen updates"), `BUS_STOP_COUNT` + `BUS_STOPS_CONFIG` (which GOVA
+stop_id(s)/route(s) to show — see "Real-Time Bus Data"; location-
+identifying, same reasoning as the weather location fields), and
+`BUS_REFRESH_SECONDS` (background check cadence for the bus feeds).
 
 ## Coding Principles
 
@@ -554,9 +1040,10 @@ screen updates").
 5. ✅ Built `display`/`renderer` modules, landscape first, then converted to portrait.
 6. ✅ Built the page state machine (`PAGE_HOME`/`PAGE_DAILY`) with touch navigation.
 7. ✅ Tuned partial-refresh regions and refresh cadence against real hardware photos, multiple rounds.
-8. ⬜ Confirm GO Transit / Metrolinx API format (JSON vs GTFS-RT) — **not started**.
-9. ⬜ Build `bus` module — **not started**.
-10. ⬜ Wire bus into scheduling/rendering — **not started**.
+8. ✅ Confirm the real transit API/agency and format — **done**: GOVA Transit (Sudbury) via Consat/tmix, GTFS-Realtime protobuf, no auth. See "Real-Time Bus Data" above and `clauderef.md`. (Corrects the original GO Transit / Metrolinx guess.)
+9. ✅ Build `bus` module (`bus.h`/`bus_static.h`/`bus_realtime.h` + .cpp) — **done, compiles clean, not yet hardware-verified**. See "Real-Time Bus Data" → "Actual Implementation".
+9a. ✅ Received a 4-screen UI mockup (`new layout.png`) for the next round of display work — see "Planned UI — Multi-Screen Layout". Not built; several real mismatches against current config/data flagged there for resolution first.
+10. ⬜ Wire bus into rendering — **not started** (currently Serial-logged only from `weather_station.ino`'s `loop()`; no renderer.cpp changes made). Blocked on resolving "Planned UI"'s open items, then designing the actual portrait layout for however many of the 4 mockup screens get built first.
 11. ⬜ Solder 40-pin header / design enclosure — optional, later, not started.
 
 ## Known toolchain gotchas (Fedora, confirmed during setup)
@@ -566,20 +1053,84 @@ screen updates").
 - `pyserial` isn't always present: `sudo dnf install python3-pyserial` if upload fails with `ModuleNotFoundError: No module named 'serial'`.
 - Serial port permissions reset on every re-enumeration (each upload). A `dialout`-group fix alone needs a relogin and can still be flaky across re-enumeration; a **udev rule targeting the exact vendor/product ID (303a:1001)** is the durable fix.
 - Upload failing for no obvious reason: hold **BOOT (IO0)**, press+release **RST**, release **BOOT**, click Upload again — forces bootloader mode manually (S3's auto-reset doesn't always trigger it).
+- **This is worse and more persistent than "sometimes needed" — confirmed
+  over many flash cycles in one session (2026-09-11).** This board's
+  native USB-Serial-JTAG peripheral is flaky about entering AND exiting
+  bootloader/download mode via software (DTR/RTS) alone:
+  - Entering download mode for an upload: auto-reset (`esptool`'s default,
+    what arduino-cli/Arduino IDE normally rely on) frequently fails with
+    "Unable to verify flash chip connection (No serial data received)" —
+    even immediately after a manual BOOT+RST, and even on an immediate
+    retry with no change at all. A physical BOOT+RST has been the only
+    reliably-successful trigger found; **holding BOOT continuously through
+    the whole upload attempt (release only after upload starts
+    succeeding), not just a quick press-release before clicking Upload,**
+    was noticeably more reliable than a brief tap — the download-mode
+    window seems to close fast.
+  - **Exiting bootloader mode afterward is a separate, equally real
+    failure mode, not just a formality.** A successful upload's own
+    "Hard resetting via RTS pin..." (`esptool`'s `--after hard_reset`, what
+    a normal Arduino IDE upload also does) can leave the chip **still
+    sitting in the ROM bootloader**, never actually running the new
+    firmware at all — indistinguishable from the outside (the display
+    just looks unchanged/stale) unless checked directly (`esptool.py
+    --before no_reset --after no_reset chip_id`: "Staying in bootloader"
+    means stuck; a connection *failure* with that same flag means it's
+    actually running — a genuinely confusing inversion the first time you
+    see it). Software commands to force an exit
+    (`--before no_reset --after hard_reset run`, plain DTR/RTS pulses via
+    a raw serial connection) were **not reliable** — only a physical
+    **plain RST press** (no BOOT) consistently worked.
+  - **Practical effect:** budget a physical button press for essentially
+    every upload AND, separately, potentially another one just to get the
+    freshly-flashed firmware to actually start running. Don't trust "the
+    upload succeeded" or "it hard-reset" as proof the new firmware is
+    running — check independently (serial output, or the display actually
+    changing) before concluding a flash didn't work when it might just be
+    stuck in bootloader.
 
 ## Next Immediate Task
 
-Weather + time + portrait display is done and verified on real hardware
-through several rounds of photo-driven iteration. The next major milestone,
-per the original project scope, is bus/transit integration:
+Weather + time + portrait display is done and verified on real hardware.
+Bus/transit went through a full build-crash-diagnose-fix-park cycle in one
+session (2026-09-11) — see "Project Status" and "Known Bugs Fixed" for the
+full story — and landed on a **confirmed-working minimal version**: one
+realtime-only "Next bus (ROUTE): N min" line, added to the *original*
+proven home screen layout (NOT the Phase-1 "Next Buses" section described
+under "Planned UI"/"Actual Display Layout" — that section's code still
+exists in `renderer.cpp` history but is not what's currently wired up;
+`weather_station.ino` currently only includes `bus_realtime.h`, not
+`bus.h`/`bus_static.h`).
 
-1. Confirm the exact GO Transit / Metrolinx API shape (JSON vs GTFS-RT) and auth method.
-2. Decide whether/how to reuse logic from the user's existing Android widget / GNOME extension for bus data, per the original project goal of not building a second parallel bus pipeline.
-3. Build the `bus` module (`bus.h`/`bus.cpp`), following the same pattern as `weather.cpp` (separate fetch/parse module, never touching rendering or driver code directly).
-4. Add a bus section to the portrait layout and wire a 1-minute refresh cadence for it, reusing the same "only redraw if actually changed" discipline already proven out for weather.
+**What to check first, before building anything further:** confirm the
+minimal line keeps working over a longer stretch (it was only confirmed
+visually in the moment, not watched for an extended period) and that the
+route/minutes shown match reality. Given how much this session's hardware
+turnaround cost (mostly the bootloader-entry flakiness in "Known toolchain
+gotchas", not the code), don't skip straight to a bigger rebuild without
+that longer confirmation first.
 
-If instead the next session is more display polish (real-hardware layout
-tuning, new pages, etc.), treat the "Actual Display Layout" and "Asset
-Generation Pipeline" sections above as the load-bearing reference — don't
-re-derive the portrait rotation math by hand, re-verify computationally
-first if it's ever in doubt.
+**Reasonable next steps, roughly in order of risk:**
+1. Show the SAME minimal line for more than one configured stop (still
+   realtime-only, still no `bus_static.cpp`/miniz) — a small, low-risk
+   extension of what's already proven.
+2. Reintroduce the full merge (`bus.cpp`) — still skip `bus_static.cpp`
+   for now; a realtime-only merge (no static-schedule fallback, no
+   day-anchoring) is a smaller step and already covers "does a bus number
+   show up" for most of the day.
+3. Only once that's solid, reintroduce `bus_static.cpp` (the static GTFS
+   schedule) — with its two already-fixed bugs (PSRAM allocator, and
+   `SET_LOOP_TASK_STACK_SIZE` for miniz's own stack needs) still in place
+   — and get a real multi-minute clean hardware run before trusting it,
+   not just a compile.
+4. The Phase-1 "Next Buses" section / full multi-screen mockup (`new
+   layout.png`, "Planned UI") comes after the data layer is solid, not
+   before — building richer UI on top of an unproven data layer is what
+   made this session's debugging hard to pin down.
+
+If instead the next session is more display polish on what's already
+proven (real-hardware layout tuning on the header/weather block, the
+existing daily-overview page, etc.), treat the "Actual Display Layout" and
+"Asset Generation Pipeline" sections above as the load-bearing reference —
+don't re-derive the portrait rotation math by hand, re-verify
+computationally first if it's ever in doubt.

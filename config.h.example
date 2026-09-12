@@ -47,3 +47,39 @@
 // every minute, so this interval is effectively how fresh the on-screen
 // numbers can ever be.
 #define WEATHER_REFRESH_MINUTES 10
+
+// --- Bus stops (GOVA Transit / Consat-tmix -- see CLAUDE.md's "Real-Time
+// Bus Data" section and clauderef.md) --------------------------------------
+// Which physical stop(s)/route(s) to show on the dashboard: the next few
+// buses serving ANY of `routes` at `stopId`, merged and sorted together --
+// one dashboard "column" per BusStopConfig entry (see BusStopConfig in
+// models.h, and bus.cpp/bus_static.cpp/bus_realtime.cpp for how this
+// drives the fetch). Location-identifying (which street corner you
+// actually catch a bus at) -- lives here in gitignored config.h rather
+// than hardcoded in bus.cpp, same reasoning as WEATHER_LATITUDE/LONGITUDE
+// above, since this repo is public.
+//
+// Each entry: { stop_id, {route_id, route_id, route_id, route_id}, how
+// many of those route slots are actually used, display label }. Unused
+// route slots MUST still be present as "" padding (BusStopConfig's array
+// is fixed-size at BUS_MAX_ROUTES_PER_STOP -- see models.h) but
+// routeCount tells the code to ignore them.
+//
+// To find your own stop_id(s)/route_id(s) for a DIFFERENT GTFS-RT agency:
+// the static schedule zip's stops.txt/routes.txt/trips.txt (see
+// STATIC_GTFS_URL in bus_static.cpp) list every stop_id and route_id the
+// agency actually uses -- these two examples are GOVA Transit's real
+// values for two real Sudbury stops, not placeholders to replace blindly.
+#define BUS_STOP_COUNT 3
+#define BUS_STOPS_CONFIG { \
+  { "1910", {"11", "", "", ""},         1, "Lasalle & Notre Dame" }, \
+  { "1820", {"1N", "105", "106", ""},   3, "1111 Notre Dame" }, \
+  { "6205", {"1N", "", "", ""},         1, "Lasalle" }, \
+}
+
+// How often to CHECK the realtime feed in the background (seconds) --
+// same "check often, redraw only on real change" split weather already
+// uses. GOVA's tmix backend showed no rate limiting even at the GNOME
+// extension's aggressive 15s cadence (see clauderef.md section 5); 30-60s
+// is plenty for an e-ink dashboard that isn't refreshing every second anyway.
+#define BUS_REFRESH_SECONDS 60

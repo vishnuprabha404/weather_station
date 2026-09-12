@@ -39,6 +39,16 @@ namespace Renderer {
   // a totally different layout from the home screen, not a partial update.
   void drawDailyScreen(const WeatherData &weather, const char* dateStr);
 
+  // FIRST, deliberately minimal step toward showing bus data (see
+  // CLAUDE.md's "Planned UI" / "Known Bugs Fixed" for why this started
+  // small after the full module's static-schedule path crashed on real
+  // hardware): draws ONE line of plain text just under the weather block,
+  // e.g. "Next bus (11): 5 min". Its own independent partial-refresh
+  // region — does not touch anything drawWeatherPartial() etc. already
+  // cover. Pass "" (empty string) to clear the line back to blank (still
+  // does the clear, so a "no data now" case doesn't leave stale text).
+  void drawNextBusLine(const char* text);
+
   // Hit-test helpers for the touchscreen. Callers must pass touch
   // coordinates already converted into PORTRAIT space (see
   // weather_station.ino's handleTouch(), which converts the raw
