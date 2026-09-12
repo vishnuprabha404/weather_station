@@ -1,5 +1,33 @@
 # CLAUDE.md — Home E-Ink Transit & Weather Display (ESP32-S3 / LILYGO T5 4.7")
 
+## ⚠️ You are on the `bus-full-module-fixed-unverified` branch
+
+Everything below was written describing the **`bus-minimal-realtime-line`**
+branch (the confirmed-working state) — most of it still applies (weather,
+portrait mode, asset pipeline, all the historical bug fixes), but anywhere
+it says the full bus module / Phase-1 "Next Buses" UI is "parked" or "not
+currently wired in," that's **not true on this branch**: here,
+`weather_station.ino` calls `bus.h`'s `fetchAllBuses()` directly and
+`renderer.cpp` has the full "Next Buses" section (`drawBusValues()`/
+`drawBusPartial()`), not the minimal `drawNextBusLine()`.
+
+**What this branch actually is:** the full bus module with all three
+known crash bugs fixed in source (see "Known Bugs Fixed" below for the
+detailed diagnosis of each) — byte-for-byte reconstructed from the exact
+build that was being tested when the decision was made to fall back to
+the simpler `bus-minimal-realtime-line` branch instead. **This exact
+combination (all three fixes together) was never confirmed clean on real
+hardware** — the last real hardware runs of something close to this
+still showed crashes, and it's not certain whether that was residual bugs
+in this code or an artifact of the bootloader-flashing chaos happening at
+the same time. Treat this branch as "compiles clean, individually-verified
+fixes, NOT proven to run cleanly end-to-end" — get a real multi-minute
+clean hardware run before trusting it, and don't be surprised if there's
+a fourth bug still lurking.
+
+If you just want the version that's actually confirmed working, switch to
+`bus-minimal-realtime-line`.
+
 ## Project Status (read this first)
 
 **Weather + time + portrait display: DONE and running on real hardware.**

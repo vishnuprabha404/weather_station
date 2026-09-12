@@ -1,9 +1,12 @@
 #include "renderer.h"
 #include "display.h"
 #include "weather.h"
+#include "bus.h"
 #include "config.h"
 #include "epd_driver.h"
 #include "icons.h"          // pre-rotated icon bitmaps + big-digit font
+#include "bus_icons.h"      // pre-rotated bus icon -- SEPARATE file from icons.h, see its own
+                             // header comment for why (icons.h's original generator is gone)
 #include "portrait_font.h"  // pre-rotated alphanumeric UI fonts (regular + small)
 #include <Arduino.h>        // Serial -- not pulled in transitively here the way it is in
                              // weather.cpp/weather_ec.cpp/weather_swob.cpp (via WiFi.h)
@@ -290,11 +293,26 @@ static const int32_t MAIN_TOP      = HEADER_DIV_PY + 20; // shifts down with TIM
                                                           // this is the "move weather section
                                                           // a little lower" the extra header
                                                           // room was traded for.
-static const int32_t FOOTER_DIV_PY = 610;
-static const int32_t FOOTER_TOP    = 630;
-static const int32_t FOOTER_COL_DIV_PX = 270; // splits Humidity | Wind
-static const int32_t FOOTER_BOTTOM_PY  = 840;
+// Removed 2026-09-11: the old FOOTER_* constants (a 2-column Humidity |
+// Wind grid at y=610-840, with its own divider at 610) — dropped to make
+// room for the new "Next Buses" section below, per the layout mockup
+// (`new layout.png`) moving humidity to a future dedicated Weather tab
+// and condensing feels-like/wind onto the main weather block itself. See
+// CLAUDE.md's "Planned UI" section. Humidity is NOT shown anywhere on
+// this screen right now as a result — known, deliberate, temporary gap
+// until the Weather tab exists.
 static const int32_t LASTUPD_PY    = 905;
+
+// --- Bus section (added 2026-09-11 -- see CLAUDE.md's "Planned UI" for
+// the full mockup this is a first, deliberately partial step toward: just
+// a compact list on the existing Home screen, no tabs/drill-down yet).
+// Sits in the space freed by removing the old Humidity|Wind footer above.
+static const int32_t BUS_DIV_PY       = 510; // divider between the weather block and this section
+static const int32_t BUS_HEADER_PY    = 530; // "NEXT BUSES" label row
+static const int32_t BUS_LIST_TOP     = 585; // first configured stop's row
+static const int32_t BUS_ROW_HEIGHT   = 95;  // vertical space per stop: label + gap + arrivals + spacing
+static const int32_t BUS_ARRIVALS_GAP = 8;   // gap between a stop's label line and its arrivals line
+static const int32_t BUS_COL2_PX      = PORTRAIT_W / 2 + 10; // 2nd arrival column start x
 
 // Partial-refresh regions, in PORTRAIT space (converted to native internally).
 // Time gets its OWN independent region so a minute-tick refresh never
@@ -311,23 +329,23 @@ static const int32_t LASTUPD_PY    = 905;
 // confirmation on a fresh hardware photo before calling this closed.
 static const int32_t DATE_PY0 = DATE_PY - 10, DATE_PY1 = TIME_TEXT_Y - 5;
 static const int32_t TIME_PY0 = TIME_TEXT_Y - 5, TIME_PY1 = TIME_TEXT_Y + (int32_t)ui_font_medium_height + 5;
-static const int32_t WEATHER_PY0 = MAIN_TOP - 10, WEATHER_PY1 = LASTUPD_PY + 30;
+// Weather block's own region (icon/temp/condition/feels-like/wind ONLY --
+// does NOT extend down through the bus section or the last-updated line
+// any more, now that there's non-weather content physically between them.
+// Sharing one wide region across content that refreshes on different
+// triggers is exactly the "Known Open Issues" mistake above, just at a
+// bigger scale -- each independently-triggered region needs its own
+// bounds, not a shared one that happens to cover multiple things.
+static const int32_t WEATHER_PY0 = MAIN_TOP - 10, WEATHER_PY1 = BUS_DIV_PY - 5;
+static const int32_t LASTUPD_REGION_PY0 = LASTUPD_PY - 5;
+static const int32_t LASTUPD_REGION_PY1 = LASTUPD_PY + (int32_t)ui_font_small_height + 10;
+// Whole bus section (divider through the last configured stop's row).
+// Recompute if BUS_STOP_COUNT (config.h) or BUS_ROW_HEIGHT above change.
+static const int32_t BUS_REGION_PY0 = BUS_DIV_PY - 10;
+static const int32_t BUS_REGION_PY1 = BUS_LIST_TOP + (int32_t)BUS_STOP_COUNT * BUS_ROW_HEIGHT + 10;
 
 // Daily-page back button, in PORTRAIT space.
 static const int32_t BACK_PX0 = 20, BACK_PY0 = 20, BACK_PX1 = 170, BACK_PY1 = 80;
-
-// --- Next-bus line (added 2026-09-11 as a deliberately small first step --
-// see CLAUDE.md's "Known Bugs Fixed"/"Planned UI": the full bus module's
-// static-schedule path crashed on real hardware (miniz needing far more
-// stack than this chip's default task stack, plus a large PSRAM-vs-
-// internal-RAM allocator bug), so this starts with just ONE realtime-only
-// line instead of the whole "Next Buses" section, to get *something*
-// working end-to-end on real hardware first.
-// Sits in the free space between "Feels like ..." (ends ~y=445) and the
-// footer divider (FOOTER_DIV_PY=610) -- plenty of room for one more line.
-static const int32_t NEXTBUS_PY = 460;
-static const int32_t NEXTBUS_REGION_PY0 = NEXTBUS_PY - 8;
-static const int32_t NEXTBUS_REGION_PY1 = NEXTBUS_PY + (int32_t)ui_font_height + 10;
 
 // ---- Time: per-character "slot" layout for cheap digit-only partial
 // refresh, drawn in the larger medium (50px) font, no border. The combo
@@ -356,7 +374,11 @@ static char lastTimeCombo[TIME_COMBO_LEN + 1] = "";
 
 static void drawStaticChrome(uint8_t* fb) {
   portraitFillRect(MARGIN, HEADER_DIV_PY, PORTRAIT_W - MARGIN, HEADER_DIV_PY + 2, fb);
-  portraitFillRect(MARGIN, FOOTER_DIV_PY, PORTRAIT_W - MARGIN, FOOTER_DIV_PY + 2, fb);
+  // The bus-section divider (BUS_DIV_PY) is intentionally NOT drawn here --
+  // drawBusValues() redraws it every time (same reasoning the old footer's
+  // inner Humidity|Wind column divider used: it sits inside a region that
+  // gets cleared+redrawn as a whole, so it has to be part of that redraw,
+  // not "static" chrome drawn once and never touched again).
 }
 
 // Location name, one line: pin icon + text (fits comfortably at full width
@@ -381,6 +403,11 @@ static void drawTimeValueFull(const char* combo, uint8_t* fb) {
   }
 }
 
+// Icon + big temp + condition + feels-like + wind ONLY -- humidity dropped
+// (see the comment where FOOTER_* used to be defined) and "last updated"
+// split out into its own function/region (drawLastUpdatedLine()) since
+// there's non-weather content (the bus section) physically between them
+// now, so they can no longer share one partial-refresh region.
 static void drawWeatherValues(const WeatherData &weather, uint8_t* fb) {
   char line[64];
 
@@ -389,10 +416,6 @@ static void drawWeatherValues(const WeatherData &weather, uint8_t* fb) {
     drawPortraitText(MARGIN, MAIN_TOP + 60, "update...", fb);
     return;
   }
-
-  // Redraw the footer's vertical divider each time (this region gets
-  // cleared and redrawn as a whole on every weather update).
-  portraitFillRect(FOOTER_COL_DIV_PX, FOOTER_TOP, FOOTER_COL_DIV_PX + 2, FOOTER_BOTTOM_PY - 10, fb);
 
   // Condition icon + big temperature, side by side
   IconRef condIcon = iconForWeather(weather.weatherCode, weather.isDay);
@@ -411,29 +434,70 @@ static void drawWeatherValues(const WeatherData &weather, uint8_t* fb) {
 
   snprintf(line, sizeof(line), "Feels like %.0fC", weather.feelsLikeC);
   drawPortraitText(textX, py, line, fb);
+  py += (int32_t)ui_font_height + 8;
 
-  // Footer: Humidity | Wind, 2 columns
-  drawPortraitBitmap(MARGIN, FOOTER_TOP, (int32_t)icon_humidity_width, (int32_t)icon_humidity_height, icon_humidity_data, fb);
-  drawPortraitText(MARGIN, FOOTER_TOP + (int32_t)icon_humidity_oheight + 15, "HUMIDITY:", fb);
-  snprintf(line, sizeof(line), "%d%%", weather.humidityPct);
-  drawPortraitText(MARGIN, FOOTER_TOP + (int32_t)icon_humidity_oheight + 50, line, fb);
+  snprintf(line, sizeof(line), "Wind %.1f km/h %s", weather.windSpeedKph,
+           windDirectionToCompass(weather.windDirectionDeg));
+  drawPortraitText(textX, py, line, fb);
+}
 
-  int32_t col2X = FOOTER_COL_DIV_PX + 20;
-  drawPortraitBitmap(col2X, FOOTER_TOP, (int32_t)icon_wind_width, (int32_t)icon_wind_height, icon_wind_data, fb);
-  drawPortraitText(col2X, FOOTER_TOP + (int32_t)icon_wind_oheight + 15, "WIND:", fb);
-  snprintf(line, sizeof(line), "%.1f km/h", weather.windSpeedKph);
-  drawPortraitText(col2X, FOOTER_TOP + (int32_t)icon_wind_oheight + 50, line, fb);
-  drawPortraitText(col2X, FOOTER_TOP + (int32_t)icon_wind_oheight + 85, windDirectionToCompass(weather.windDirectionDeg), fb);
-
-  // "Last updated", small and de-emphasized, bottom-left.
-  char updated12h[16];
+// "Weather updated at ...", small and de-emphasized -- its own function/
+// region now (see WEATHER_PY1/LASTUPD_REGION_* above) rather than the tail
+// end of drawWeatherValues(), since the bus section sits between them on
+// screen and each needs to be clearable independently.
+static void drawLastUpdatedLine(const WeatherData &weather, uint8_t* fb) {
+  if (!weather.valid) return;
+  char updated12h[16], line[48];
   formatTime12h(weather.lastUpdated, updated12h, sizeof(updated12h));
   snprintf(line, sizeof(line), "Weather updated at %s", updated12h);
   drawPortraitTextSmall(MARGIN, LASTUPD_PY, line, fb);
 }
 
-void Renderer::drawFullScreen(const WeatherData &weather, const char* timeStr12h,
-                               const char* dateStr, const char* tzStr) {
+// "NEXT BUSES" section: a divider + header, then one row per configured
+// stop (BUS_STOP_COUNT entries, config.h) -- label line, then up to 2
+// arrivals side by side (route, ETA, delay-if-live, clock time). First
+// pass at this layout -- like every other layout constant in this
+// project, treat BUS_* above as "best estimate, needs a real hardware
+// photo to confirm," not as tuned/final (see CLAUDE.md's "Planned UI").
+static void drawBusValues(const BusStopResult* results, int count, uint8_t* fb) {
+  portraitFillRect(MARGIN, BUS_DIV_PY, PORTRAIT_W - MARGIN, BUS_DIV_PY + 2, fb);
+
+  drawPortraitBitmap(MARGIN, BUS_HEADER_PY, (int32_t)icon_bus_width, (int32_t)icon_bus_height, icon_bus_data, fb);
+  drawPortraitText(MARGIN + (int32_t)icon_bus_oheight + 12, BUS_HEADER_PY, "NEXT BUSES", fb);
+
+  int32_t rowY = BUS_LIST_TOP;
+  for (int i = 0; i < count; i++, rowY += BUS_ROW_HEIGHT) {
+    const BusStopResult &r = results[i];
+    drawPortraitText(MARGIN, rowY, r.label, fb);
+
+    int32_t arrivalsY = rowY + (int32_t)ui_font_height + BUS_ARRIVALS_GAP;
+    if (!r.hasAnyData) {
+      drawPortraitTextSmall(MARGIN, arrivalsY, "No data", fb);
+      continue;
+    }
+    if (r.arrivalCount == 0) {
+      drawPortraitTextSmall(MARGIN, arrivalsY, "No upcoming buses", fb);
+      continue;
+    }
+
+    int32_t colX[2] = { MARGIN, BUS_COL2_PX };
+    for (int c = 0; c < 2 && c < r.arrivalCount; c++) {
+      const BusArrival &a = r.arrivals[c];
+      char eta[16], clock[16], line[64];
+      formatBusEta(a.minutes, a.live, eta, sizeof(eta));
+      formatBusClock12h(a.epoch, clock, sizeof(clock));
+      if (a.live && a.delayMin != 0) {
+        snprintf(line, sizeof(line), "%s %s (%+d) %s", a.route, eta, a.delayMin, clock);
+      } else {
+        snprintf(line, sizeof(line), "%s %s %s", a.route, eta, clock);
+      }
+      drawPortraitTextSmall(colX[c], arrivalsY, line, fb);
+    }
+  }
+}
+
+void Renderer::drawFullScreen(const WeatherData &weather, const BusStopResult* busResults, int busCount,
+                               const char* timeStr12h, const char* dateStr, const char* tzStr) {
   Display::clearBuffer();
   uint8_t* fb = Display::framebuffer();
 
@@ -445,6 +509,8 @@ void Renderer::drawFullScreen(const WeatherData &weather, const char* timeStr12h
   drawDateValue(dateStr, fb);
   drawTimeValueFull(combo, fb);
   drawWeatherValues(weather, fb);
+  drawLastUpdatedLine(weather, fb);
+  drawBusValues(busResults, busCount, fb);
 
   Display::fullRefresh();
 
@@ -496,15 +562,18 @@ void Renderer::drawWeatherPartial(const WeatherData &weather) {
   epd_poweron();
   epd_clear_area(portraitRectToNative(MARGIN - 10, WEATHER_PY0, PORTRAIT_W - MARGIN + 10, WEATHER_PY1));
   drawWeatherValues(weather, NULL);
+  // Separate region: the bus section now sits physically between the
+  // weather block and this line, so they can't share one clear+redraw
+  // any more (see WEATHER_PY1/LASTUPD_REGION_* above).
+  epd_clear_area(portraitRectToNative(MARGIN - 10, LASTUPD_REGION_PY0, PORTRAIT_W - MARGIN + 10, LASTUPD_REGION_PY1));
+  drawLastUpdatedLine(weather, NULL);
   epd_poweroff();
 }
 
-void Renderer::drawNextBusLine(const char* text) {
+void Renderer::drawBusPartial(const BusStopResult* busResults, int busCount) {
   epd_poweron();
-  epd_clear_area(portraitRectToNative(MARGIN - 10, NEXTBUS_REGION_PY0, PORTRAIT_W - MARGIN + 10, NEXTBUS_REGION_PY1));
-  if (text && text[0]) {
-    drawPortraitText(MARGIN, NEXTBUS_PY, text, NULL);
-  }
+  epd_clear_area(portraitRectToNative(MARGIN - 10, BUS_REGION_PY0, PORTRAIT_W - MARGIN + 10, BUS_REGION_PY1));
+  drawBusValues(busResults, busCount, NULL);
   epd_poweroff();
 }
 
@@ -564,6 +633,10 @@ bool Renderer::isDailyPageBackButtonTap(int32_t px, int32_t py) {
   return px >= BACK_PX0 && px < BACK_PX1 && py >= BACK_PY0 && py < BACK_PY1;
 }
 
+// Bounds shrunk to just the weather block now that the old footer is gone
+// and there's a non-interactive bus section below it instead (no
+// drill-down page for bus data exists yet -- see CLAUDE.md's "Planned
+// UI" -- so that area intentionally does nothing on tap for now).
 bool Renderer::isHomeScreenWeatherTap(int32_t px, int32_t py) {
-  return px >= 0 && px < PORTRAIT_W && py >= WEATHER_PY0 && py < FOOTER_DIV_PY;
+  return px >= 0 && px < PORTRAIT_W && py >= WEATHER_PY0 && py < WEATHER_PY1;
 }

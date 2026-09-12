@@ -10,18 +10,28 @@
 #include "weather.h"
 #include "weather_ec.h"
 #include "weather_swob.h"
-#include "bus_realtime.h" // deliberately NOT bus.h/bus_static.h -- see below
+#include "bus.h"
 #include "display.h"
 #include "renderer.h"
 
-// Cheap safety margin, kept even for this minimal realtime-only bus step:
-// this core's task stack defaults to 8192 bytes (confirmed by reading
-// main.cpp directly), which a full HTTPS+protobuf-decode call chain
-// (bus_realtime.cpp) can plausibly get close to even without touching
-// bus_static.cpp/miniz at all (that combination is what actually caused
-// the ~10KB+ single-frame overflow documented in CLAUDE.md's "Known Bugs
-// Fixed" -- not reachable from this minimal path, but this costs little
-// and buys real margin against a similar surprise elsewhere).
+// BUG FIX (2026-09-11, found from a real hardware stack-overflow crash --
+// see CLAUDE.md's "Known Bugs Fixed" for the full diagnosis): this
+// project's Arduino core (2.0.15) defaults setup()/loop()'s own task
+// ("loopTask") to an 8192-byte stack (confirmed by reading main.cpp
+// directly). That was already tight once bus.cpp's HTTPS-heavy call
+// chains were added, but the real breaking point turned out to be
+// miniz's OWN internal zip-decompression routine
+// (mz_zip_reader_extract_to_mem_no_alloc1, used by bus_static.cpp to pull
+// trips.txt/stop_times.txt/calendar_dates.txt out of GOVA's gtfs.zip) --
+// confirmed via objdump to need a ~9.6KB stack frame on its own, which
+// alone exceeds the entire default stack. This isn't something fixable
+// inside miniz's own logic (that's how much state real DEFLATE
+// decompression needs); the correct, standard fix for Arduino-ESP32 is to
+// give the task itself more stack via this weak-symbol override (declared
+// in Arduino.h) -- must be at file scope, not inside setup()/loop().
+// 32KB was picked as generous headroom above the ~11-12KB peak actually
+// measured (miniz's frame + its caller's + this project's own bus-fetch
+// call chain up to that point), not tuned to the exact minimum.
 SET_LOOP_TASK_STACK_SIZE(32768);
 
 static const char* TZ_STRING  = "EST5EDT,M3.2.0,M11.1.0"; // Sudbury, ON — handles EST/EDT
@@ -50,58 +60,30 @@ static const unsigned long FULL_REFRESH_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL
 static int  lastRenderedMinute = -1;      // guards against firing twice in the same :01 window
 static char lastDrawnDateStr[32] = "";    // only redraw the date when this actually changes
 
-// --- Bus data: FIRST, deliberately minimal step (2026-09-11) --------------
-// The full bus module (bus.cpp/bus_static.cpp, static GTFS zip via miniz +
-// realtime merge + a whole "Next Buses" section) crashed on real hardware
-// twice over -- a stack overflow inside miniz's own decompression code
-// (needs ~10KB+ of stack on its own, more than this chip's entire default
-// 8KB task stack) and a heap-corruption bug from miniz defaulting to
-// internal-RAM allocations for a 4.78MB file. Both are root-caused and
-// fixed (see CLAUDE.md's "Known Bugs Fixed"), but rather than keep
-// debugging the full stack blind, this starts over small: ONE line of
-// text, realtime-feed-only (bus_realtime.cpp, no bus_static.cpp/miniz
-// involved at all -- so none of the above can even be reached from this
-// path), showing just the soonest upcoming bus at the FIRST configured
-// stop. No headsign, no static-schedule fallback for a blank route_id, no
-// multi-stop merge. Once this is confirmed working on real hardware, the
-// full module can be reintroduced deliberately, piece by piece.
-static const BusStopConfig NEXT_BUS_STOPS[BUS_STOP_COUNT] = BUS_STOPS_CONFIG; // config.h
-static char lastBusLine[48] = "";
+// --- Bus data (GOVA Transit / Consat-tmix) ---------------------------------
+// Drawn as a compact "Next Buses" section on the home screen -- see
+// CLAUDE.md's "Planned UI" for the full mockup this is a first, partial
+// step toward (no tabs/drill-down yet, just this one section).
+static BusStopResult busResults[BUS_STOP_COUNT];
 static unsigned long lastBusAttemptMs = 0;
-static const unsigned long BUS_INTERVAL_MS = (unsigned long)BUS_REFRESH_SECONDS * 1000UL; // config.h
+static const unsigned long BUS_INTERVAL_MS = (unsigned long)BUS_REFRESH_SECONDS * 1000UL; // config.h -- CHECK cadence
 
-// Fetches the realtime feed (bus_realtime.cpp) and picks the single
-// soonest non-cancelled arrival at NEXT_BUS_STOPS[0], formatting it as one
-// line, e.g. "Next bus (11): 5 min". Returns false if the feed itself
-// failed OR simply had nothing for that stop right now -- caller decides
-// what to do (this project's convention: keep showing the last known line
-// rather than blanking it for a transient miss).
-static bool fetchNextBusLine(char* out, size_t outLen) {
-  static RealtimeCandidate candidates[BUS_MAX_REALTIME_CANDIDATES];
-  int count = 0;
-  if (!fetchRealtimeCandidates(NEXT_BUS_STOPS, BUS_STOP_COUNT, candidates, &count, BUS_MAX_REALTIME_CANDIDATES)) {
-    return false;
-  }
-
-  time_t nowEpoch = time(nullptr);
-  const RealtimeCandidate* best = nullptr;
-  for (int i = 0; i < count; i++) {
-    if (candidates[i].cancelled) continue;
-    if (strcmp(candidates[i].stopId, NEXT_BUS_STOPS[0].stopId) != 0) continue;
-    if (best == nullptr || candidates[i].epoch < best->epoch) best = &candidates[i];
-  }
-  if (best == nullptr) return false; // feed was fine, just nothing due at this stop right now
-
-  time_t epoch = best->stoppedNow ? nowEpoch : best->epoch;
-  long minutes = (long)((epoch - nowEpoch + 30) / 60); // round to nearest minute
-  if (minutes < 0) minutes = 0;
-  // route_id can be blank on the wire (tmix/Consat quirk -- see
-  // clauderef.md); no static schedule to fall back on in this minimal
-  // version, so just show "?" rather than an empty/misleading label.
-  const char* route = best->route[0] ? best->route : "?";
-  snprintf(out, outLen, "Next bus (%s): %ld min", route, minutes);
-  return true;
-}
+// What's actually drawn on the panel right now, so a fetch can diff
+// against it (busDisplayChanged()) -- same idea as currentWeather, but
+// kept separate from busResults since busResults gets overwritten by
+// every fetch regardless of whether it ends up redrawn.
+static BusStopResult lastDrawnBusResults[BUS_STOP_COUNT];
+static unsigned long lastBusRedrawMs = 0;
+// A live countdown ticks down almost every check even when nothing about
+// the underlying schedule/realtime actually changed (unlike weather, which
+// is often genuinely stable for many cycles) -- redrawing on every fetch
+// (BUS_INTERVAL_MS, 60s) would flash the panel far more than weather ever
+// does. This throttles the REDRAW to a slower cadence, decoupled from the
+// fetch cadence the same way weather already decouples "how often we
+// check" from "how often we flash the e-ink" -- just with an extra outer
+// throttle here since bus data "changes" (per busDisplayChanged()) far
+// more often than weather's ever does.
+static const unsigned long BUS_REDRAW_INTERVAL_MS = 5UL * 60UL * 1000UL; // 5 minutes
 
 // Combines THREE independent sources into one WeatherData -- see the
 // comment above the struct in models.h for which fields each one owns:
@@ -149,6 +131,32 @@ static bool fetchAllWeather(WeatherData &out) {
   merged.valid = true;
   out = merged;
   return true;
+}
+
+// Serial-only for now (see the comment on busResults above) -- prints
+// exactly the information a future renderer would need, so this fetch/
+// merge logic can be sanity-checked against the real feed on real
+// hardware before any layout work starts.
+static void logBusResults() {
+  for (int i = 0; i < BUS_STOP_COUNT; i++) {
+    const BusStopResult &r = busResults[i];
+    Serial.printf("[bus] %s (%s): ", r.label, r.stopId);
+    if (r.arrivalCount == 0) {
+      Serial.println(r.hasAnyData ? "no upcoming buses" : "no data");
+      continue;
+    }
+    Serial.println();
+    for (int j = 0; j < r.arrivalCount; j++) {
+      const BusArrival &a = r.arrivals[j];
+      char eta[16];
+      formatBusEta(a.minutes, a.live, eta, sizeof(eta));
+      if (a.live) {
+        Serial.printf("  route %-4s -> %-20s %-8s [live, %+d min]\n", a.route, a.headsign, eta, a.delayMin);
+      } else {
+        Serial.printf("  route %-4s -> %-20s %-8s [scheduled]\n", a.route, a.headsign, eta);
+      }
+    }
+  }
 }
 
 static void connectWiFi() {
@@ -249,7 +257,8 @@ static void doFullRefresh() {
   strncpy(lastDrawnDateStr, dateStr, sizeof(lastDrawnDateStr) - 1);
   lastDrawnDateStr[sizeof(lastDrawnDateStr) - 1] = '\0';
 
-  Renderer::drawFullScreen(currentWeather, timeStr, dateStr, tzStr);
+  Renderer::drawFullScreen(currentWeather, busResults, BUS_STOP_COUNT, timeStr, dateStr, tzStr);
+  memcpy(lastDrawnBusResults, busResults, sizeof(lastDrawnBusResults));
 }
 
 void setup() {
@@ -275,6 +284,7 @@ void setup() {
   }
 
   fetchAllWeather(currentWeather); // best effort; screen below shows "waiting..." if it fails
+  fetchAllBuses(busResults);       // best effort; drawBusValues() shows "No data" per stop if it fails
 
   // One full-screen draw at boot: chrome (dividers/labels) + initial values.
   // Deliberately done BEFORE touch init: this is the core feature, and it
@@ -282,19 +292,11 @@ void setup() {
   // ever misbehaves during its own setup.
   doFullRefresh();
 
-  // Minimal bus line -- best effort, drawn separately right after the full
-  // refresh above (drawFullScreen() itself is untouched -- see the comment
-  // on NEXT_BUS_STOPS for why this stays this simple for now).
-  if (fetchNextBusLine(lastBusLine, sizeof(lastBusLine))) {
-    Renderer::drawNextBusLine(lastBusLine);
-  } else {
-    Serial.println("[bus] no data yet at boot");
-  }
-
   unsigned long now = millis();
   lastWeatherAttemptMs = now;
   lastFullRefreshMs = now;
   lastBusAttemptMs = now;
+  lastBusRedrawMs = now;
 
   initTouch(); // best-effort; touch navigation just stays disabled if this fails
 }
@@ -332,7 +334,6 @@ static void handleTouch() {
     Serial.println("[touch] back tapped -> home");
     currentPage = PAGE_HOME;
     doFullRefresh(); // redraw home with whatever's current now
-    Renderer::drawNextBusLine(lastBusLine); // doFullRefresh() doesn't draw this -- restore it separately
   }
 }
 
@@ -370,24 +371,31 @@ void loop() {
     }
   }
 
-  // Bus: checked every BUS_REFRESH_SECONDS (config.h -- much more often
-  // than weather, since a countdown is only useful if actually current),
-  // but only redrawn when the formatted line actually changed, same
-  // "check often, flash the panel only when it'd look different" idea
-  // weather already uses.
+  // Bus data: fetched on its own independent cadence (BUS_REFRESH_SECONDS,
+  // config.h) regardless of which page is showing (same as weather's
+  // background check above) -- but the panel is only actually redrawn when
+  // busDisplayChanged() says something would look different AND the
+  // separate BUS_REDRAW_INTERVAL_MS throttle has elapsed (see its comment
+  // above busResults for why a countdown display needs that extra
+  // throttle, unlike weather). Redraw itself only ever touches the HOME
+  // SCREEN, same as weather.
   if (now - lastBusAttemptMs >= BUS_INTERVAL_MS) {
     lastBusAttemptMs = now;
-    char newBusLine[48];
-    if (fetchNextBusLine(newBusLine, sizeof(newBusLine))) {
-      if (strcmp(newBusLine, lastBusLine) != 0) {
-        if (currentPage == PAGE_HOME) Renderer::drawNextBusLine(newBusLine);
-        strncpy(lastBusLine, newBusLine, sizeof(lastBusLine) - 1);
-        lastBusLine[sizeof(lastBusLine) - 1] = '\0';
-      } else {
+    if (fetchAllBuses(busResults)) {
+      logBusResults();
+      bool changed = busDisplayChanged(busResults, lastDrawnBusResults, BUS_STOP_COUNT);
+      bool dueForRedraw = (now - lastBusRedrawMs) >= BUS_REDRAW_INTERVAL_MS;
+      if (changed && dueForRedraw && currentPage == PAGE_HOME) {
+        Renderer::drawBusPartial(busResults, BUS_STOP_COUNT);
+        memcpy(lastDrawnBusResults, busResults, sizeof(lastDrawnBusResults));
+        lastBusRedrawMs = now;
+      } else if (!changed) {
         Serial.println("[bus] no visible change since last check, skipping redraw");
+      } else if (!dueForRedraw) {
+        Serial.println("[bus] display changed but redraw throttle hasn't elapsed yet, skipping");
       }
     } else {
-      Serial.println("[bus] fetch failed or nothing due right now, keeping last shown line");
+      Serial.println("[main] bus fetch failed (no data from either source for any stop)");
     }
   }
 
@@ -400,7 +408,6 @@ void loop() {
       lastFullRefreshMs = now;
       Serial.println("[main] periodic full refresh (anti-ghosting)");
       doFullRefresh();
-      Renderer::drawNextBusLine(lastBusLine); // doFullRefresh() doesn't draw this -- restore it separately
     }
 
     // Clock tick: driven by the REAL clock's seconds, not a millis()
@@ -417,3 +424,4 @@ void loop() {
 
   delay(1000); // ~1x/sec is plenty to reliably catch touches and the :01 mark
 }
+

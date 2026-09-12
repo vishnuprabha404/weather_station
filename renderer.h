@@ -15,9 +15,10 @@
 namespace Renderer {
   // One-time full-screen draw (chrome: location/dividers/labels, plus
   // whatever values are known at boot). Uses the main framebuffer + a full
-  // e-ink refresh. Call once from setup().
-  void drawFullScreen(const WeatherData &weather, const char* timeStr12h,
-                       const char* dateStr, const char* tzStr);
+  // e-ink refresh. Call once from setup(). `busResults` must have
+  // BUS_STOP_COUNT (config.h) entries -- see bus.h's fetchAllBuses().
+  void drawFullScreen(const WeatherData &weather, const BusStopResult* busResults, int busCount,
+                       const char* timeStr12h, const char* dateStr, const char* tzStr);
 
   // Partial refresh of ONLY the time+timezone area — does not touch the
   // date or anything else. Call every minute.
@@ -29,25 +30,27 @@ namespace Renderer {
   // reason.
   void drawDatePartial(const char* dateStr);
 
-  // Partial refresh of ONLY the weather info area (temp, wind, condition,
-  // feels like, humidity, last update) — does not touch the rest of the
-  // panel. Call every 30 minutes (whenever fresh weather data arrives).
+  // Partial refresh of ONLY the weather info area (icon, temp, condition,
+  // feels like, wind, last-updated line) — does not touch the rest of the
+  // panel, INCLUDING the bus section below it (that has its own region —
+  // see drawBusPartial()). Call whenever fresh weather data arrives and
+  // weatherDisplayChanged() says it would actually look different.
   void drawWeatherPartial(const WeatherData &weather);
+
+  // Partial refresh of ONLY the "Next Buses" section — does not touch
+  // weather, the header, or anything else. `busResults` must have
+  // BUS_STOP_COUNT (config.h) entries. Call whenever fresh bus data
+  // arrives and busDisplayChanged() (bus.h) says it would actually look
+  // different — see CLAUDE.md's "Planned UI" for why this is throttled to
+  // a slower cadence than the underlying fetch (a live countdown changes
+  // almost every cycle, unlike weather, so redrawing on every fetch would
+  // flash the panel far more than weather ever does).
+  void drawBusPartial(const BusStopResult* busResults, int busCount);
 
   // Full-screen "today at a glance" page: high/low, sunrise/sunset, max
   // wind, precipitation chance, plus a back button. Full refresh — this is
   // a totally different layout from the home screen, not a partial update.
   void drawDailyScreen(const WeatherData &weather, const char* dateStr);
-
-  // FIRST, deliberately minimal step toward showing bus data (see
-  // CLAUDE.md's "Planned UI" / "Known Bugs Fixed" for why this started
-  // small after the full module's static-schedule path crashed on real
-  // hardware): draws ONE line of plain text just under the weather block,
-  // e.g. "Next bus (11): 5 min". Its own independent partial-refresh
-  // region — does not touch anything drawWeatherPartial() etc. already
-  // cover. Pass "" (empty string) to clear the line back to blank (still
-  // does the clear, so a "no data now" case doesn't leave stale text).
-  void drawNextBusLine(const char* text);
 
   // Hit-test helpers for the touchscreen. Callers must pass touch
   // coordinates already converted into PORTRAIT space (see
